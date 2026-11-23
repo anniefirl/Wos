@@ -963,6 +963,38 @@ local function findDropButton()
   return nil
 end
 
+-- confirmation popup after Drop: the game spells it "Conform"
+local function findConfirmButton(exceptBtn)
+  local pg = getPlayerGui()
+  if not pg then return nil end
+  for _, nm in ipairs({"Conform", "Confirm", "Yes", "OK"}) do
+    local b = nil
+    pcall(function() b = pg:FindFirstChild(nm, true) end)
+    if b and b ~= exceptBtn then return b end
+  end
+  local all = nil
+  pcall(function() all = pg:GetDescendants() end)
+  if all then
+    for _, d in ipairs(all) do
+      if (d.ClassName == "TextButton" or d.ClassName == "ImageButton") and d ~= exceptBtn then
+        local hit = false
+        pcall(function()
+          local n = string.lower(d.Name or "")
+          if string.find(n, "conform") or string.find(n, "confirm") then hit = true end
+        end)
+        if not hit then
+          pcall(function()
+            local t = string.lower(d.Text or "")
+            if string.find(t, "conform") or string.find(t, "confirm") then hit = true end
+          end)
+        end
+        if hit then return d end
+      end
+    end
+  end
+  return nil
+end
+
 local dropRemote = nil
 local warnedNoDropRemote = false
 
@@ -1064,6 +1096,13 @@ local function dropOneOf(itemName, myToken)
       local dropBtn = findDropButton()
       if dropBtn then
         clickGui(dropBtn)
+        task.wait(0.4)
+        -- confirmation popup after Drop ("Conform" in this game)
+        local confirmBtn = findConfirmButton(dropBtn)
+        if confirmBtn then
+          clickGui(confirmBtn)
+          say("Conform pressed for " .. itemName)
+        end
         task.wait(0.5)
         if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
       end
@@ -1564,7 +1603,7 @@ DropsTab:AddButton({
 
 DropsTab:AddButton({
   Title    = "Drop All",
-  Subtitle = "Legendary -> Shiny -> Stand -> Locacaca, each to 0 (press again to stop)",
+  Subtitle = "Toggle: loops Legendary -> Shiny -> Stand -> Locacaca until stopped",
   Icon     = "package",
   Text     = "Drop All",
   Callback = function()
@@ -1576,29 +1615,27 @@ DropsTab:AddButton({
       say("Drop stopped")
       return
     end
-    local wasAuto = Flags.Auto
     Flags.Auto = false
     pcall(function() autoToggle:Set(false) end)
     sweepToken = sweepToken + 1 -- pause farming so the player holds the drop spot
     local myToken = sweepToken
     dropRunning = true
-    setStatus("Status: drop started - frozen at drop spot")
-    say("Drop All started: Legendary -> Shiny -> Stand -> Locacaca (frozen at 298, 17, 207)")
+    setStatus("Status: drop ON - looping until stopped")
+    say("Drop All ON: Legendary -> Shiny -> Stand -> Locacaca, looping until stopped (frozen at 298, 17, 207)")
     task.spawn(function()
-      local emptied, sawAny = dropAllPriority(myToken)
-      unfreezeNow()
-      if myToken == sweepToken then
-        dropRunning = false
-        if not sawAny then
-          setStatus("Status: drop found no inventory/items - run Scan GUI")
-          say("Drop All saw no inventory or items - press Scan GUI and share the log")
-        elseif wasAuto then
-          Flags.Auto = true
-          pcall(function() autoToggle:Set(true) end)
-          setStatus("Status: auto on (1->54) - resumed after drop")
-          say("Drop done - farming resumed")
+      local warned = false
+      while not cancelled(myToken) do
+        local emptied, sawAny = dropAllPriority(myToken)
+        if cancelled(myToken) then break end
+        if not sawAny and not warned then
+          warned = true
+          setStatus("Status: drop sees no inventory/items - run Scan GUI")
+          say("Drop All sees no inventory or items - press Scan GUI and share the log")
         end
+        task.wait(1.5)
       end
+      unfreezeNow()
+      if myToken == sweepToken then dropRunning = false end
     end)
   end,
 })
@@ -1708,6 +1745,13 @@ if FALLBACK then
     drop.Name = "Drop"
     drop.Text = "Drop"
     drop.Parent = frame
+    local conform = Instance.new("TextButton")
+    conform.Name = "Conform"
+    conform.Text = "Conform"
+    conform.Parent = frame
+    conform.Activate = function(self)
+      print("Demo: Conform pressed")
+    end
     local demoPack = Instance.new("Folder")
     demoPack.Name = "Backpack"
     LP.Backpack = demoPack
