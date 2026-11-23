@@ -29,7 +29,9 @@ local warnedNoRemote = false
 local sweepToken = 0
 local manualRunning = false
 local dropRunning = false
+local internalRunning = false
 local dropToggle -- assigned in the Drops tab; the real Auto Drop switch
+local internalToggle -- assigned in the Drops tab; the headless Internal Drop switch
 local FALLBACK -- assigned when VantixUI loads below; forward so getHRP sees it
 
 -- any sweep carrying an old token must stop at its next checkpoint.
@@ -1191,7 +1193,7 @@ local function tryDropRemote(handle, itemName)
   local rem = getDropRemote()
   if not rem then
     if not warnedNoDropRemote then
-      say("No drop remote found - GUI drop only")
+      say("No drop remote found - internal drops use Backspace only")
       warnedNoDropRemote = true
     end
     return
@@ -1243,10 +1245,10 @@ local function dropOneOf(itemName, myToken)
         end
         if hum and hum.EquipTool then hum:EquipTool(slot) end
       end)
-      task.wait(0.15)
+      task.wait(0.35)
     else
       clickGui(slot)
-      task.wait(0.2)
+      task.wait(0.4)
     end
     if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
     -- recount tools first: gone from hands AND pack means actually dropped
@@ -1268,19 +1270,19 @@ local function dropOneOf(itemName, myToken)
       if preConfirm then
         clickGui(preConfirm)
         say("Conform pressed for " .. itemName)
-        task.wait(0.3)
+        task.wait(0.6)
       else
         -- 2. Drop button, then POLL for the confirmation (it can pop in late)
         local dropBtn = findDropButton()
         if dropBtn then
           clickGui(dropBtn)
-          task.wait(0.2)
+          task.wait(0.4)
           local confirmBtn = nil
           for i = 1, 25 do
             if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
             confirmBtn = findConfirmButton(dropBtn)
             if confirmBtn then break end
-            task.wait(0.1)
+            task.wait(0.15)
           end
           if confirmBtn then
             clickGui(confirmBtn)
@@ -1288,7 +1290,7 @@ local function dropOneOf(itemName, myToken)
           else
             say("Drop: no Conform popup appeared for " .. itemName .. " (press Scan GUI if this repeats)")
           end
-          task.wait(0.25)
+          task.wait(0.5)
         else
           say("Drop: no Drop button found for " .. itemName .. " - trying remote/Backspace")
         end
@@ -1303,18 +1305,18 @@ local function dropOneOf(itemName, myToken)
         noProgress = 0
       else
         tryDropRemote(t3 or s3, itemName)
-        task.wait(0.25)
+        task.wait(0.5)
         if isTool then
           -- last resort: Backspace drops the equipped tool in default backpacks
           pcall(function()
             local vim = game:GetService("VirtualInputManager")
             if vim and vim.SendKeyEvent then
               vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
-              task.wait(0.1)
+              task.wait(0.2)
               vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
             end
           end)
-          task.wait(0.2)
+          task.wait(0.4)
         end
         if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
         local t4 = findHeldTool(itemName)
@@ -1332,7 +1334,7 @@ local function dropOneOf(itemName, myToken)
       say("Could not drop " .. itemName .. " - leaving it and moving on")
       return false, saw
     end
-    task.wait(0.05)
+    task.wait(0.1)
   end
   setStatus("Status: drop [" .. itemName .. "] gave up after 30 tries")
   return false, saw
@@ -1371,11 +1373,138 @@ local function dropAllPriority(myToken)
     if saw then sawAny = true end
     if ok then emptied = emptied + 1 end
     if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-    task.wait(0.05)
+    task.wait(0.1)
   end
   if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
   setStatus("Status: drop done - arrows/fruit at 0")
   say("Drop All done")
+  return emptied, sawAny
+end
+
+-- HEADLESS drop: no inventory GUI, no slot clicks, no Drop/Conform buttons.
+-- Works purely inside the game: equip each held tool, fire the drop remote
+-- when one is known, Backspace the equipped tool, verify it is gone from
+-- Backpack AND Character. GUI-only stacks (no tool, no remote) are skipped
+-- with a log line - those still need the GUI Auto Drop.
+local function dropOneInternal(itemName, myToken)
+  local saw = false
+  local noProgress = 0
+  for attempt = 1, 30 do
+    if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+    local tool = findHeldTool(itemName)
+    if tool then
+      saw = true
+      setStatus("Status: drop [" .. itemName .. "] (internal)...")
+      -- equip it so Backspace / the remote has something to drop
+      pcall(function()
+        local char = LP.Character
+        local hum = nil
+        if char then
+          if char.FindFirstChildOfClass then hum = char:FindFirstChildOfClass("Humanoid")
+          else hum = char:FindFirstChild("Humanoid") end
+        end
+        if hum and hum.EquipTool then hum:EquipTool(tool) end
+      end)
+      task.wait(0.5)
+      if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+      local rem = getDropRemote()
+      if rem then
+        if rem.ClassName == "RemoteFunction" then
+          pcall(function() rem:InvokeServer(tool) end)
+        else
+          pcall(function() rem:FireServer(tool) end)
+          pcall(function() rem:FireServer(itemName) end)
+        end
+        task.wait(0.5)
+        if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+      end
+      -- Backspace drops the equipped tool in default backpacks, no GUI needed
+      pcall(function()
+        local vim = game:GetService("VirtualInputManager")
+        if vim and vim.SendKeyEvent then
+          vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
+          task.wait(0.2)
+          vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
+        end
+      end)
+      task.wait(0.5)
+      if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+      if not findHeldTool(itemName) then
+        if not findItemSlot(itemName) then return true, saw end
+        noProgress = 0
+      else
+        noProgress = noProgress + 1
+      end
+    else
+      -- nothing held: only a known drop remote could remove a server-side stack
+      local rem = getDropRemote()
+      local slot = findItemSlot(itemName)
+      if rem and slot then
+        saw = true
+        setStatus("Status: drop [" .. itemName .. "] (internal remote)...")
+        if rem.ClassName == "RemoteFunction" then
+          pcall(function() rem:InvokeServer(itemName) end)
+        else
+          pcall(function() rem:FireServer(itemName) end)
+        end
+        task.wait(0.5)
+        if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+        local t2 = findHeldTool(itemName)
+        local s2 = findItemSlot(itemName)
+        if not t2 and not s2 then return true, saw end
+        noProgress = noProgress + 1
+      else
+        return true, saw
+      end
+    end
+    if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+    if noProgress >= 3 then
+      setStatus("Status: drop [" .. itemName .. "] stuck (internal), moving on")
+      say("Could not drop " .. itemName .. " internally - try the GUI Auto Drop")
+      return false, saw
+    end
+  end
+  setStatus("Status: drop [" .. itemName .. "] gave up after 30 tries")
+  return false, saw
+end
+
+-- anything droppable without opening the GUI? no teleport, no waits.
+local function dropHasInternalWork()
+  for _, itemName in ipairs(DropOrder) do
+    if findHeldTool(itemName) then return true end
+    if getDropRemote() and findItemSlot(itemName) then return true end
+  end
+  return false
+end
+
+-- headless priority order: legendary -> shiny -> stand -> locacaca, each
+-- until 0. freezes at the drop spot like the GUI path, but the inventory
+-- is never opened and nothing is ever clicked.
+local function dropAllInternal(myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return 0, false end
+  freezeAtDropSpot()
+  if not getHRP() then
+    setStatus("Status: waiting for character...")
+    task.wait(1)
+    return 0, false
+  end
+  say("Internal drop: inventory stays closed, nothing is clicked")
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  local emptied = 0
+  local sawAny = false
+  for _, itemName in ipairs(DropOrder) do
+    if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
+    setStatus("Status: drop [" .. itemName .. "] (internal)...")
+    local ok, saw = dropOneInternal(itemName, myToken)
+    if saw then sawAny = true
+    else say("Internal: " .. itemName .. " not held - skipped") end
+    if ok then emptied = emptied + 1 end
+    if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
+    task.wait(0.1)
+  end
+  if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
+  setStatus("Status: internal drop done")
+  say("Internal drop done")
   return emptied, sawAny
 end
 
@@ -1633,9 +1762,11 @@ local autoToggle = FarmTab:AddToggle({
     if state then
       -- farming takes over: halt any drop loop and show its switch as off
       dropRunning = false
+      internalRunning = false
       pcall(function() if dropToggle then dropToggle:Set(false) end end)
+      pcall(function() if internalToggle then internalToggle:Set(false) end end)
     else
-      manualRunning = false dropRunning = false unfreezeNow()
+      manualRunning = false dropRunning = false internalRunning = false unfreezeNow()
     end
     say("Auto Collect " .. (state and "enabled" or "disabled"))
     Window:Notify({ Title = "Auto Collect", Text = state and "Enabled" or "Disabled", Duration = 2 })
@@ -1795,7 +1926,9 @@ FarmTab:AddButton({
     sweepToken = sweepToken + 1
     manualRunning = false
     dropRunning = false
+    internalRunning = false
     pcall(function() if dropToggle then dropToggle:Set(false) end end)
+    pcall(function() if internalToggle then internalToggle:Set(false) end end)
     unfreezeNow()
     setStatus("Status: stopped")
     say("Stopped")
@@ -1868,6 +2001,8 @@ dropToggle = DropsTab:AddToggle({
   Callback = function(state)
     if state then
       if dropRunning then return end
+      internalRunning = false
+      pcall(function() if internalToggle then internalToggle:Set(false) end end)
       Flags.Auto = false
       pcall(function() autoToggle:Set(false) end)
       sweepToken = sweepToken + 1 -- pause farming so the player holds the drop spot
@@ -1904,7 +2039,7 @@ dropToggle = DropsTab:AddToggle({
               setStatus("Status: drop sees no inventory/items - run Scan GUI")
               say("Drop All sees no inventory or items - press Scan GUI and share the log")
             end
-            task.wait(0.25)
+            task.wait(0.5)
           end
         end
         unfreezeNow()
@@ -1917,6 +2052,65 @@ dropToggle = DropsTab:AddToggle({
       unfreezeNow()
       setStatus("Status: stopped")
       say("Drop stopped")
+    end
+  end,
+})
+
+internalToggle = DropsTab:AddToggle({
+  Title    = "Internal Drop",
+  Subtitle = "Headless: equip + Backspace/remote, inventory never opens",
+  Icon     = "terminal",
+  Default  = false,
+  Callback = function(state)
+    if state then
+      if internalRunning then return end
+      dropRunning = false
+      pcall(function() if dropToggle then dropToggle:Set(false) end end)
+      Flags.Auto = false
+      pcall(function() autoToggle:Set(false) end)
+      sweepToken = sweepToken + 1 -- pause farming so the player holds the drop spot
+      local myToken = sweepToken
+      internalRunning = true
+      setStatus("Status: internal drop ON - looping until stopped")
+      say("Internal Drop ON: headless, inventory stays closed (frozen at 298, 17, 207)")
+      task.spawn(function()
+        local warned = false
+        local blindSweeps = 0
+        while not cancelled(myToken) do
+          if not dropHasInternalWork() then
+            if cancelled(myToken) then break end
+            blindSweeps = blindSweeps + 1
+            if blindSweeps == 1 then
+              setStatus("Status: internal idle - watching for held items")
+            end
+            if blindSweeps >= 3 and not warned then
+              warned = true
+              setStatus("Status: internal sees nothing held - run Scan GUI")
+              say("Internal Drop sees no held items - press Scan GUI and share the log")
+            end
+            task.wait(2.5)
+          else
+            blindSweeps = 0
+            local emptied, sawAny = dropAllInternal(myToken)
+            if cancelled(myToken) then break end
+            if not sawAny and not warned then
+              warned = true
+              setStatus("Status: internal sees nothing held - run Scan GUI")
+              say("Internal Drop sees no held items or remote targets - press Scan GUI and share the log")
+            end
+            task.wait(0.5)
+          end
+        end
+        unfreezeNow()
+        if myToken == sweepToken then internalRunning = false end
+      end)
+    else
+      if not internalRunning then return end
+      sweepToken = sweepToken + 1
+      internalRunning = false
+      unfreezeNow()
+      setStatus("Status: stopped")
+      say("Internal drop stopped")
     end
   end,
 })
@@ -2080,6 +2274,32 @@ if FALLBACK then
       -- popup appears; the actual removal happens on Conform
       conform.Visible = true
     end
+    -- the game's internal drop remote (what Internal Drop fires instead of
+    -- touching the GUI): removes the named held tool, server-side.
+    local demoDropRemote = Instance.new("RemoteEvent")
+    demoDropRemote.Name = "DropItem"
+    demoDropRemote.Parent = ReplicatedStorage
+    demoDropRemote.OnServerEvent:Connect(function(player, what)
+      local name = nil
+      pcall(function()
+        if typeof(what) == "Instance" then name = what.Name
+        elseif type(what) == "string" then name = what end
+      end)
+      if not name then return end
+      print("Demo server: internal drop of " .. tostring(name))
+      pcall(function()
+        local pack = nil
+        if LP and LP.FindFirstChild then pack = LP:FindFirstChild("Backpack") end
+        if not pack and LP then pack = LP.Backpack end
+        for _, cont in ipairs({pack, LP.Character}) do
+          if cont then
+            for _, c in ipairs(cont:GetChildren()) do
+              if c.Name == name then c.Parent = nil return end
+            end
+          end
+        end
+      end)
+    end)
   end)
   print("Demo: dropping arrows/fruit like Drop All does (frozen at 298, 17, 207).")
   holdDropSpot()
