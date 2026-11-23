@@ -897,99 +897,40 @@ local function parseSlotCount(slot)
 end
 
 -- normalized compare so "Legendary_Arrow", "legendary arrow " etc still match
-local function normName(s)
-  s = string.lower(s or "")
-  s = string.gsub(s, "[^%a%d]", "")
-  return s
-end
-
 -- returns slot gui + count for an item inside one container (frame scope).
--- pass 1 is the proven exact logic (own Name/Text, then child TextLabel);
--- passes 2-3 are fuzzy fallbacks for decorated names ("Legendary Arrow ★").
--- clickables are preferred over their parent containers, so a list frame
--- never shadows the actual slot button inside it.
+-- deliberately simple exact matching: own Name/Text, then child TextLabel.
+-- (the fuzzy normalized matcher was faster but misfired in-game, so this
+-- stays on the old slow exact path that actually worked.)
 local function findItemSlotIn(container, itemName)
   if not container then return nil end
-  local want = normName(itemName)
-  if want == "" then return nil end
+  local want = string.lower(itemName)
   local all = nil
   pcall(function() all = container:GetDescendants() end)
   if not all then return nil end
-  local function isSlotClass(d)
-    local cls = d.ClassName
-    return cls == "TextButton" or cls == "ImageButton" or cls == "Frame" or cls == "ImageLabel" or cls == "TextLabel"
-  end
-  local function ownNorms(d)
-    local out = {}
-    pcall(function() if d.Name then out[#out + 1] = normName(d.Name) end end)
-    pcall(function() if d.Text then out[#out + 1] = normName(d.Text) end end)
-    return out
-  end
-  local function childLabelNorms(d)
-    local out = {}
-    pcall(function()
-      for _, c in ipairs(d:GetDescendants()) do
-        if c.ClassName == "TextLabel" then
-          local t = nil
-          pcall(function() t = c.Text end)
-          if t then out[#out + 1] = normName(t) end
-        end
-      end
-    end)
-    return out
-  end
-  local cands = {}
   for _, d in ipairs(all) do
-    if isSlotClass(d) then cands[#cands + 1] = d end
-  end
-  local function isClickable(d)
-    return d.ClassName == "TextButton" or d.ClassName == "ImageButton"
-  end
-  -- pass 1a: exact own-text on clickables
-  for _, d in ipairs(cands) do
-    if isClickable(d) then
-      for _, t in ipairs(ownNorms(d)) do
-        if t ~= "" and t == want then return d, parseSlotCount(d) end
+    local cls = d.ClassName
+    if cls == "TextButton" or cls == "ImageButton" or cls == "Frame" or cls == "ImageLabel" or cls == "TextLabel" then
+      local match = false
+      pcall(function()
+        if d.Name and string.lower(d.Name) == want then match = true end
+      end)
+      if not match then
+        pcall(function()
+          if d.Text and string.lower(d.Text) == want then match = true end
+        end)
       end
-    end
-  end
-  -- pass 1b: exact own-text on frames/labels (TextLabels skipped here on
-  -- purpose: a nested label match must resolve to its slot frame in 1c,
-  -- clicking the bare label does nothing)
-  for _, d in ipairs(cands) do
-    if not isClickable(d) and d.ClassName ~= "TextLabel" then
-      for _, t in ipairs(ownNorms(d)) do
-        if t ~= "" and t == want then return d, parseSlotCount(d) end
+      if not match then
+        pcall(function()
+          for _, c in ipairs(d:GetDescendants()) do
+            if c.ClassName == "TextLabel" and c.Text and string.lower(c.Text) == want then
+              match = true
+              break
+            end
+          end
+        end)
       end
-    end
-  end
-  -- pass 1c: exact child-label text (slot frame named "Slot1")
-  for _, d in ipairs(cands) do
-    for _, t in ipairs(childLabelNorms(d)) do
-      if t ~= "" and t == want then return d, parseSlotCount(d) end
-    end
-  end
-  -- pass 2: fuzzy (name decorated with rarity/icons) - haystack must
-  -- CONTAIN the full wanted name; never the reverse, so a bare "Arrow"
-  -- label can never shadow a real "Shiny Arrow" slot.
-  if #want >= 4 then
-    for _, d in ipairs(cands) do
-      if isClickable(d) then
-        for _, t in ipairs(ownNorms(d)) do
-          if t ~= "" and string.find(t, want, 1, true) then return d, parseSlotCount(d) end
-        end
-      end
-    end
-    for _, d in ipairs(cands) do
-      if not isClickable(d) and d.ClassName ~= "TextLabel" then
-        for _, t in ipairs(ownNorms(d)) do
-          if t ~= "" and string.find(t, want, 1, true) then return d, parseSlotCount(d) end
-        end
-      end
-    end
-    for _, d in ipairs(cands) do
-      for _, t in ipairs(childLabelNorms(d)) do
-        if t ~= "" and string.find(t, want, 1, true) then return d, parseSlotCount(d) end
+      if match then
+        return d, parseSlotCount(d)
       end
     end
   end
@@ -1072,54 +1013,33 @@ findHeldTool = function(itemName)
   return found
 end
 
-local function buttonMatches(d, words)
-  local hit = false
-  pcall(function()
-    local n = string.lower(d.Name or "")
-    for _, w in ipairs(words) do
-      if string.find(n, w, 1, true) then hit = true break end
-    end
-  end)
-  if not hit then
-    pcall(function()
-      local t = string.lower(d.Text or "")
-      for _, w in ipairs(words) do
-        if string.find(t, w, 1, true) then hit = true break end
-      end
-    end)
-  end
-  return hit
-end
-
-local function findDropButtonIn(container, exceptBtn)
-  if not container then return nil end
-  for _, nm in ipairs({"Drop", "DropItem", "DropAll", "Discard", "Delete", "Trash", "Toss"}) do
+-- old global Drop search (slow, whole PlayerGui, no usability filter on the
+-- exact-name pass): kept because this is the version that worked in-game.
+local function findDropButton()
+  local pg = getPlayerGui()
+  if not pg then return nil end
+  for _, nm in ipairs({"Drop", "DropItem", "DropAll", "Discard", "Delete", "Trash"}) do
     local b = nil
-    pcall(function() b = container:FindFirstChild(nm, true) end)
-    if b and b ~= exceptBtn and btnUsable(b) then return b end
+    pcall(function() b = pg:FindFirstChild(nm, true) end)
+    if b then return b end
   end
   local all = nil
-  pcall(function() all = container:GetDescendants() end)
+  pcall(function() all = pg:GetDescendants() end)
   if all then
     for _, d in ipairs(all) do
-      if (d.ClassName == "TextButton" or d.ClassName == "ImageButton") and d ~= exceptBtn and btnUsable(d) then
-        if buttonMatches(d, {"drop", "discard", "toss", "trash"}) then return d end
+      if d.ClassName == "TextButton" or d.ClassName == "ImageButton" then
+        local hit = false
+        pcall(function()
+          if d.Name and string.find(string.lower(d.Name), "drop") then hit = true end
+        end)
+        if not hit then
+          pcall(function()
+            if d.Text and string.find(string.lower(d.Text), "drop") then hit = true end
+          end)
+        end
+        if hit then return d end
       end
     end
-  end
-  return nil
-end
-
-local function findDropButton(exceptBtn)
-  -- inventory subtree first: a global "Drop" elsewhere (trade menu etc)
-  -- is the wrong button and stalled the whole loop looking "broke".
-  local frame = getInvFrame()
-  local b = findDropButtonIn(frame, exceptBtn)
-  if b then return b end
-  local pg = getPlayerGui()
-  if pg and pg ~= frame then
-    b = findDropButtonIn(pg, exceptBtn)
-    if b then return b end
   end
   return nil
 end
@@ -1130,9 +1050,9 @@ btnUsable = function(b)
   pcall(function()
     if b.Visible == false then ok = false end
   end)
-  -- NOTE: Active is ignored on purpose. ImageButtons often report
-  -- Active=false while still firing Activated/clicks via firesignal,
-  -- and rejecting them made Conform unpressable ("drop broke").
+  pcall(function()
+    if b.Active == false then ok = false end
+  end)
   pcall(function()
     local cur = b.Parent
     while cur and cur.ClassName ~= "PlayerGui" and cur.ClassName ~= "DataModel" do
@@ -1147,33 +1067,33 @@ btnUsable = function(b)
 end
 
 -- confirmation popup after Drop: the game spells it "Conform"
-local function findConfirmButtonIn(container, exceptBtn)
-  if not container then return nil end
+local function findConfirmButton(exceptBtn)
+  local pg = getPlayerGui()
+  if not pg then return nil end
   for _, nm in ipairs({"Conform", "Confirm", "Yes", "OK"}) do
     local b = nil
-    pcall(function() b = container:FindFirstChild(nm, true) end)
+    pcall(function() b = pg:FindFirstChild(nm, true) end)
     if b and b ~= exceptBtn and btnUsable(b) then return b end
   end
   local all = nil
-  pcall(function() all = container:GetDescendants() end)
+  pcall(function() all = pg:GetDescendants() end)
   if all then
     for _, d in ipairs(all) do
       if (d.ClassName == "TextButton" or d.ClassName == "ImageButton") and d ~= exceptBtn and btnUsable(d) then
-        if buttonMatches(d, {"conform", "confirm"}) then return d end
+        local hit = false
+        pcall(function()
+          local n = string.lower(d.Name or "")
+          if string.find(n, "conform") or string.find(n, "confirm") then hit = true end
+        end)
+        if not hit then
+          pcall(function()
+            local t = string.lower(d.Text or "")
+            if string.find(t, "conform") or string.find(t, "confirm") then hit = true end
+          end)
+        end
+        if hit then return d end
       end
     end
-  end
-  return nil
-end
-
-local function findConfirmButton(exceptBtn)
-  local frame = getInvFrame()
-  local b = findConfirmButtonIn(frame, exceptBtn)
-  if b then return b end
-  local pg = getPlayerGui()
-  if pg and pg ~= frame then
-    b = findConfirmButtonIn(pg, exceptBtn)
-    if b then return b end
   end
   return nil
 end
@@ -1258,10 +1178,10 @@ local function dropOneOf(itemName, myToken)
         end
         if hum and hum.EquipTool then hum:EquipTool(slot) end
       end)
-      task.wait(0.12)
+      task.wait(0.35)
     else
       clickGui(slot)
-      task.wait(0.15)
+      task.wait(0.4)
     end
     if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
     -- recount tools first: gone from hands AND pack means actually dropped
@@ -1275,36 +1195,26 @@ local function dropOneOf(itemName, myToken)
     if progressed then
       noProgress = 0
     else
-      -- select/equip alone did nothing: confirmation first, then Drop, then remote
+      -- old slow path that worked: leftover confirmation first, then Drop
+      -- + a patient poll for the popup, then remote + Backspace every try.
       -- 1. leftover confirmation from the last attempt? press it, don't re-drop
       local preConfirm = findConfirmButton(nil)
       if preConfirm then
         clickGui(preConfirm)
         say("Conform pressed for " .. itemName)
-        task.wait(0.3)
+        task.wait(0.6)
       else
         -- 2. Drop button, then POLL for the confirmation (it can pop in late)
-        local dropBtn = findDropButton(nil)
+        local dropBtn = findDropButton()
         if dropBtn then
           clickGui(dropBtn)
-          -- some games morph the SAME button into the confirm step:
-          -- if it now reads conform/confirm, press it again directly.
-          local morphed = false
-          pcall(function()
-            local t = string.lower(dropBtn.Text or "")
-            if string.find(t, "conform") or string.find(t, "confirm") then morphed = true end
-          end)
-          if morphed then
-            task.wait(0.2)
-            clickGui(dropBtn)
-            say("Conform pressed for " .. itemName)
-          end
+          task.wait(0.4)
           local confirmBtn = nil
           for i = 1, 25 do
             if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
             confirmBtn = findConfirmButton(dropBtn)
             if confirmBtn then break end
-            task.wait(0.1)
+            task.wait(0.15)
           end
           if confirmBtn then
             clickGui(confirmBtn)
@@ -1312,7 +1222,7 @@ local function dropOneOf(itemName, myToken)
           else
             say("Drop: no Conform popup appeared for " .. itemName .. " (press Scan GUI if this repeats)")
           end
-          task.wait(0.2)
+          task.wait(0.5)
         else
           say("Drop: no Drop button found for " .. itemName .. " - trying remote/Backspace")
         end
@@ -1326,26 +1236,19 @@ local function dropOneOf(itemName, myToken)
       if progressed2 then
         noProgress = 0
       else
-        -- rate-limited: firing the remote + Backspace every single attempt
-        -- spammed the server and got players kicked ("drops, then crashes").
-        -- GUI clicks run every attempt; remote/Backspace at most 1 in 3.
-        if attempt % 3 == 1 then
-          tryDropRemote(t3 or s3, itemName)
-          task.wait(0.2)
-          if isTool then
-            -- last resort: Backspace drops the equipped tool in default backpacks
-            pcall(function()
-              local vim = game:GetService("VirtualInputManager")
-              if vim and vim.SendKeyEvent then
-                vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
-                task.wait(0.1)
-                vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
-              end
-            end)
-            task.wait(0.15)
-          end
-        else
-          task.wait(0.2)
+        tryDropRemote(t3 or s3, itemName)
+        task.wait(0.5)
+        if isTool then
+          -- last resort: Backspace drops the equipped tool in default backpacks
+          pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            if vim and vim.SendKeyEvent then
+              vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
+              task.wait(0.2)
+              vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
+            end
+          end)
+          task.wait(0.4)
         end
         if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
         local t4 = findHeldTool(itemName)
