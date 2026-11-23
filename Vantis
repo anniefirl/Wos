@@ -657,15 +657,25 @@ local function freezeAtDropSpot()
   return hrp
 end
 
--- light maintenance between drops: re-pin + re-anchor + zero motion, no waits
+-- light maintenance between drops: only re-teleport when drifted more than
+-- 2.5 studs (no more constant teleport spam), always hold the anchor.
 local function holdDropSpot()
   pcall(function()
     local hrp = getHRP()
-    if hrp then
+    if not hrp then return end
+    local drifted = true
+    pcall(function()
+      local p = hrp.Position
+      local dx = p.X - DropSpotX
+      local dy = p.Y - DropSpotY
+      local dz = p.Z - DropSpotZ
+      drifted = math.sqrt(dx * dx + dy * dy + dz * dz) > 2.5
+    end)
+    if drifted then
       zeroMotion(hrp)
       hrp.CFrame = dropSpotCFrame()
-      hrp.Anchored = true
     end
+    hrp.Anchored = true
   end)
 end
 
@@ -679,34 +689,27 @@ end
 -- Drop All: priority order, click each item then drop until its count is 0.
 local DropOrder = {"Legendary Arrow", "Shiny Arrow", "Stand Arrow", "Locacaca Fruit"}
 
--- clicks a GuiButton with every available method. never throws.
+-- clicks a GuiButton the way a real click does: fire EVERY signal the game
+-- could listen on (down + click + activated + connections + Activate).
+-- never throws. returns true if anything was attempted.
 local function clickGui(btn)
   if btn == nil then return false end
   local clicked = false
   pcall(function()
-    if btn.Activate then
-      btn:Activate()
+    if typeof(firesignal) == "function" and btn.MouseButton1Down then
+      firesignal(btn.MouseButton1Down)
       clicked = true
     end
   end)
-  if clicked then return true end
   pcall(function()
     if typeof(firesignal) == "function" and btn.MouseButton1Click then
       firesignal(btn.MouseButton1Click)
       clicked = true
     end
   end)
-  if clicked then return true end
-  pcall(function()
-    if typeof(firesignal) == "function" and btn.Activated then
-      firesignal(btn.Activated)
-      clicked = true
-    end
-  end)
-  if clicked then return true end
   pcall(function()
     if typeof(getconnections) == "function" then
-      for _, sigName in ipairs({"Activated", "MouseButton1Click"}) do
+      for _, sigName in ipairs({"MouseButton1Click", "MouseButton1Down", "Activated"}) do
         local sig = btn[sigName]
         if sig then
           for _, c in ipairs(getconnections(sig)) do
@@ -715,6 +718,18 @@ local function clickGui(btn)
           end
         end
       end
+    end
+  end)
+  pcall(function()
+    if btn.Activate then
+      btn:Activate()
+      clicked = true
+    end
+  end)
+  pcall(function()
+    if typeof(firesignal) == "function" and btn.Activated then
+      firesignal(btn.Activated)
+      clicked = true
     end
   end)
   return clicked
@@ -884,8 +899,9 @@ end
 -- drops ONE item name until its count is 0. returns true when empty.
 local function dropOneOf(itemName, myToken)
   local noProgress = 0
+  local saw = false
   for attempt = 1, 30 do
-    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
     holdDropSpot()
     local slot = nil
     local count = 0
@@ -894,14 +910,16 @@ local function dropOneOf(itemName, myToken)
     if s then
       slot = s
       count = c or 1
+      saw = true
     else
       local tool = findBackpackTool(itemName)
       if not tool then
-        return true
+        return true, saw
       end
       slot = tool
       count = 1
       isTool = true
+      saw = true
     end
     setStatus("Status: drop [" .. itemName .. "] (" .. count .. " left)...")
     if isTool then
@@ -919,13 +937,13 @@ local function dropOneOf(itemName, myToken)
       clickGui(slot)
       task.wait(0.4)
     end
-    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
     -- recount: gone means one click dropped it
     local s2, c2 = findItemSlot(itemName)
     local t2 = nil
     if not s2 then t2 = findBackpackTool(itemName) end
     if not s2 and not t2 then
-      return true
+      return true, saw
     end
     local left2 = s2 and (c2 or 1) or 1
     if s2 and left2 < count then
@@ -936,11 +954,11 @@ local function dropOneOf(itemName, myToken)
       if dropBtn then
         clickGui(dropBtn)
         task.wait(0.5)
-        if cancelled(myToken) then setStatus("Status: stopped") return false end
+        if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
         local s3, c3 = findItemSlot(itemName)
         local t3 = nil
         if not s3 then t3 = findBackpackTool(itemName) end
-        if not s3 and not t3 then return true end
+        if not s3 and not t3 then return true, saw end
         local left3 = s3 and (c3 or 1) or 1
         if s3 and left3 < count then
           noProgress = 0
@@ -950,7 +968,7 @@ local function dropOneOf(itemName, myToken)
           local s4, c4 = findItemSlot(itemName)
           local t4 = nil
           if not s4 then t4 = findBackpackTool(itemName) end
-          if not s4 and not t4 then return true end
+          if not s4 and not t4 then return true, saw end
           local left4 = s4 and (c4 or 1) or 1
           if s4 and left4 < count then noProgress = 0
           else noProgress = noProgress + 1 end
@@ -961,43 +979,95 @@ local function dropOneOf(itemName, myToken)
         local s5, c5 = findItemSlot(itemName)
         local t5 = nil
         if not s5 then t5 = findBackpackTool(itemName) end
-        if not s5 and not t5 then return true end
+        if not s5 and not t5 then return true, saw end
         local left5 = s5 and (c5 or 1) or 1
         if s5 and left5 < count then noProgress = 0
         else noProgress = noProgress + 1 end
       end
     end
-    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
     if noProgress >= 3 then
       setStatus("Status: drop [" .. itemName .. "] stuck, moving on")
       say("Could not drop " .. itemName .. " - leaving it and moving on")
-      return false
+      return false, saw
     end
     task.wait(0.4)
   end
   setStatus("Status: drop [" .. itemName .. "] gave up after 30 tries")
-  return false
+  return false, saw
 end
 
 -- priority order: legendary -> shiny -> stand -> locacaca, each until 0.
 local function dropAllPriority(myToken)
-  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  if cancelled(myToken) then setStatus("Status: stopped") return 0, false end
   freezeAtDropSpot()
   openInventory()
   if cancelled(myToken) then setStatus("Status: stopped") return 0 end
   local emptied = 0
+  local sawAny = false
   for _, itemName in ipairs(DropOrder) do
-    if cancelled(myToken) then setStatus("Status: stopped") return emptied end
+    if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
     setStatus("Status: drop [" .. itemName .. "]...")
-    local ok = dropOneOf(itemName, myToken)
+    local ok, saw = dropOneOf(itemName, myToken)
+    if saw then sawAny = true end
     if ok then emptied = emptied + 1 end
-    if cancelled(myToken) then setStatus("Status: stopped") return emptied end
+    if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
     task.wait(0.3)
   end
-  if cancelled(myToken) then setStatus("Status: stopped") return emptied end
+  if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
   setStatus("Status: drop done - arrows/fruit at 0")
   say("Drop All done")
-  return emptied
+  return emptied, sawAny
+end
+
+-- Scan: dumps PlayerGui tree + backpack + drop/inventory remotes into the log
+-- so a mismatched GUI name can be identified. never throws.
+local function scanGameGui()
+  local who = "?"
+  pcall(function() if LP then who = tostring(LP.Name) end end)
+  say("Scan: PlayerGui of " .. who)
+  local pg = getPlayerGui()
+  if not pg then
+    say("Scan: no PlayerGui found")
+  else
+    local all = nil
+    pcall(function() all = pg:GetDescendants() end)
+    if all then
+      say("Scan: PlayerGui has " .. #all .. " descendants (first 80):")
+      for i = 1, math.min(#all, 80) do
+        local d = all[i]
+        local extra = ""
+        pcall(function()
+          if d.Text then extra = " text=" .. tostring(d.Text) end
+        end)
+        say("  " .. d.ClassName .. " '" .. tostring(d.Name) .. "'" .. extra)
+      end
+    end
+  end
+  pcall(function()
+    local pack = LP and LP.FindFirstChild and LP:FindFirstChild("Backpack")
+    if pack then
+      local kids = pack:GetChildren()
+      say("Scan: backpack has " .. #kids .. " tools:")
+      for _, c in ipairs(kids) do
+        say("  " .. c.ClassName .. " '" .. tostring(c.Name) .. "'")
+      end
+    else
+      say("Scan: no Backpack")
+    end
+  end)
+  pcall(function()
+    local rs = game:GetService("ReplicatedStorage")
+    for _, d in ipairs(rs:GetDescendants()) do
+      if d.ClassName == "RemoteEvent" or d.ClassName == "RemoteFunction" then
+        local nm = string.lower(d.Name)
+        if string.find(nm, "drop") or string.find(nm, "discard") or string.find(nm, "invent") then
+          say("Scan remote: " .. d.ClassName .. " '" .. tostring(d.Name) .. "'")
+        end
+      end
+    end
+  end)
+  say("Scan done - share the lines above")
 end
 
 -- VantixUI load (real) or fallback shim (editor mock)
@@ -1355,6 +1425,18 @@ SettingsTab:AddButton({
 
 local DropsTab = Window:AddTab("Drops", "package")
 DropsTab:AddButton({
+  Title    = "Scan GUI",
+  Subtitle = "Lists inventory/backpack/remotes in the log",
+  Icon     = "search",
+  Text     = "Scan",
+  Callback = function()
+    task.spawn(function()
+      scanGameGui()
+    end)
+  end,
+})
+
+DropsTab:AddButton({
   Title    = "Drop All",
   Subtitle = "Legendary -> Shiny -> Stand -> Locacaca, each to 0 (press again to stop)",
   Icon     = "package",
@@ -1377,11 +1459,14 @@ DropsTab:AddButton({
     setStatus("Status: drop started - frozen at drop spot")
     say("Drop All started: Legendary -> Shiny -> Stand -> Locacaca (frozen at 298, 17, 207)")
     task.spawn(function()
-      dropAllPriority(myToken)
+      local emptied, sawAny = dropAllPriority(myToken)
       unfreezeNow()
       if myToken == sweepToken then
         dropRunning = false
-        if wasAuto then
+        if not sawAny then
+          setStatus("Status: drop found no inventory/items - run Scan GUI")
+          say("Drop All saw no inventory or items - press Scan GUI and share the log")
+        elseif wasAuto then
           Flags.Auto = true
           pcall(function() autoToggle:Set(true) end)
           setStatus("Status: auto on (1->54) - resumed after drop")
