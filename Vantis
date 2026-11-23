@@ -782,6 +782,26 @@ local function openInventory()
   return true
 end
 
+-- forces the game to rebuild its item list: close, reopen, recount.
+-- the client GUI often keeps showing dropped items (ghosts) even though the
+-- server already removed them - without this both the player AND the script
+-- recount believe items that are already gone.
+local function refreshInventory()
+  local gui = getInvFrame()
+  if not gui then return nil end
+  setGuiOpen(gui, false)
+  task.wait(0.4)
+  setGuiOpen(gui, true)
+  task.wait(0.5)
+  if isGuiOpen(gui) then return gui end
+  local toggle = findInventoryToggle()
+  if toggle then
+    clickGui(toggle)
+    task.wait(0.4)
+  end
+  return gui
+end
+
 -- Drop spot: while auto drop runs, the player is frozen here, standing upright.
 -- (Pitching the root part lays the whole rig flat, which left the character
 -- positioned wrong - so the character stands and the camera looks down instead.)
@@ -1425,7 +1445,20 @@ local function dropOneOf(itemName, myToken)
         if not t4 and not s4 then return true, saw end
         local progressed3 = (not isTool) and s4 and (c4 or 1) < count
         if progressed3 then noProgress = 0
-        else noProgress = noProgress + 1 end
+        else
+          -- ghost guard: the list may still show an item the server already
+          -- removed. force a rebuild, then recount the FRESH list before
+          -- calling this attempt stuck.
+          refreshInventory()
+          if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+          local t5 = findHeldTool(itemName)
+          local s5, c5 = nil, nil
+          if not t5 then s5, c5 = findItemSlot(itemName) end
+          if not t5 and not s5 then return true, saw end
+          local progressed4 = (not isTool) and s5 and (c5 or 1) < count
+          if progressed4 then noProgress = 0
+          else noProgress = noProgress + 1 end
+        end
       end
     end
     if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
@@ -1479,6 +1512,9 @@ local function dropAllPriority(myToken)
     task.wait(0.1)
   end
   if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
+  -- final rebuild so the player sees the true (empty) list, not ghosts.
+  refreshInventory()
+  if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
   setStatus("Status: drop done - arrows/fruit at 0")
   say("Drop All done")
   return emptied, sawAny
@@ -1491,6 +1527,7 @@ end
 -- with a log line - those still need the GUI Auto Drop.
 local function dropOneInternal(itemName, myToken)
   local saw = false
+  local droppedTool = false
   local noProgress = 0
   for attempt = 1, 30 do
     if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
@@ -1532,14 +1569,19 @@ local function dropOneInternal(itemName, myToken)
       end)
       task.wait(0.5)
       if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+      -- hands AND pack empty means actually dropped. a lingering GUI entry
+      -- after this is a ghost (stale client list), not a real item.
       if not findHeldTool(itemName) then
-        if not findItemSlot(itemName) then return true, saw end
-        noProgress = 0
+        droppedTool = true
+        return true, saw
       else
         noProgress = noProgress + 1
       end
     else
-      -- nothing held: only a known drop remote could remove a server-side stack
+      -- nothing held and we already dropped tools this run: anything left
+      -- on screen is a ghost. otherwise only a known drop remote could
+      -- remove a real server-side stack.
+      if droppedTool then return true, saw end
       local rem = getDropRemote()
       local slot = findItemSlot(itemName)
       if rem and slot then
@@ -1564,6 +1606,9 @@ local function dropOneInternal(itemName, myToken)
     if noProgress >= 3 then
       setStatus("Status: drop [" .. itemName .. "] stuck (internal), moving on")
       say("Could not drop " .. itemName .. " internally - try the GUI Auto Drop")
+      pcall(function()
+        Window:Notify({ Title = "Drop stuck", Text = itemName .. " would not drop - see log", Duration = 4 })
+      end)
       return false, saw
     end
   end
