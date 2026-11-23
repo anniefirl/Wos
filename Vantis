@@ -26,6 +26,16 @@ local uniqueOpened = 0
 local totalOpens = 0
 local warnedNoRemote = false
 
+local sweepToken = 0
+local manualRunning = false
+local dropRunning = false
+
+-- any sweep carrying an old token must stop at its next checkpoint.
+-- nil token = no cancellation (demo / one-off calls).
+local function cancelled(myToken)
+  return myToken ~= nil and myToken ~= sweepToken
+end
+
 -- created by the UI below, callbacks only use them later
 local status = nil
 local countLabel = nil
@@ -305,12 +315,14 @@ local function tryRemoteFallback(chestModel, num, attempt)
   end
 end
 
-local function gotoPosition(pos, method)
+local function gotoPosition(pos, method, myToken)
   local hrp = getHRP()
-  if not hrp then return end
+  if not hrp then return false end
+  if cancelled(myToken) then return false end
   if method == "Tween" then
     local from = hrp.Position
     for i = 1, 10 do
+      if cancelled(myToken) then return false end
       local t = i / 10
       hrp.CFrame = CFrame.new(
         from.X + (pos.X - from.X) * t,
@@ -321,10 +333,12 @@ local function gotoPosition(pos, method)
   else
     hrp.CFrame = CFrame.new(pos.X, pos.Y + 3, pos.Z)
   end
+  return true
 end
 
 -- walk back to a remembered chest whose area isn't rendered.
-local function visitRemembered(num, pos)
+local function visitRemembered(num, pos, myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return nil end
   local hrp = getHRP()
   if not hrp then return nil end
   setStatus("Status: [" .. num .. "] area not rendered, walking back...")
@@ -333,7 +347,9 @@ local function visitRemembered(num, pos)
     pcall(function() LP:RequestStreamAroundAsync(pos) end)
   end
   for _ = 1, 10 do
+    if cancelled(myToken) then setStatus("Status: stopped") return nil end
     task.wait(0.5)
+    if cancelled(myToken) then setStatus("Status: stopped") return nil end
     local e = findChestByNum(num)
     if e and e.prompt and e.part and e.part.Position then
       say("Chest " .. num .. " streamed in")
@@ -345,13 +361,15 @@ local function visitRemembered(num, pos)
 end
 
 -- collect ONE numbered chest. always moves on after MaxTries. returns true if opened.
-local function collectOneNum(num)
+local function collectOneNum(num, myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return false end
   local e = findChestByNum(num)
   if not e then
     local mem = memory[num]
     if mem then
-      e = visitRemembered(num, mem)
+      e = visitRemembered(num, mem, myToken)
     end
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
   end
   if not e then
     setStatus("Status: [" .. num .. "] not found, skipping")
@@ -366,12 +384,17 @@ local function collectOneNum(num)
     return true
   end
   memory[num] = e.part.Position
-  gotoPosition(e.part.Position, Flags.Method)
+  if cancelled(myToken) then setStatus("Status: stopped") return false end
+  local moved = gotoPosition(e.part.Position, Flags.Method, myToken)
+  if not moved then setStatus("Status: stopped") return false end
   task.wait(0.25)
+  if cancelled(myToken) then setStatus("Status: stopped") return false end
   for attempt = 1, Flags.MaxTries do
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
     setStatus("Status: [" .. num .. "] opening (try " .. attempt .. "/" .. Flags.MaxTries .. ")...")
     holdPrompt(e.prompt)
     task.wait(0.6)
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
     -- re-read opened state: prompt path alone is often enough
     if isOpened(e) then
       if not openedSet[num] then openedSet[num] = true uniqueOpened = uniqueOpened + 1 end
@@ -383,8 +406,10 @@ local function collectOneNum(num)
       return true
     end
     -- prompt alone failed: try the remote fallback once, then check again
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
     tryRemoteFallback(e.model, num, attempt)
     task.wait(0.5)
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
     -- re-read opened state
     if isOpened(e) then
       if not openedSet[num] then openedSet[num] = true uniqueOpened = uniqueOpened + 1 end
@@ -398,6 +423,7 @@ local function collectOneNum(num)
     -- prompt may have been replaced; re-resolve once
     if attempt < Flags.MaxTries then
       task.wait(0.3)
+      if cancelled(myToken) then setStatus("Status: stopped") return false end
       local fresh = findChestByNum(num)
       if fresh then e = fresh end
     end
@@ -407,17 +433,21 @@ local function collectOneNum(num)
 end
 
 -- THE sweep: strict numeric order From -> To. never repeats a chest in one sweep.
-local function collectOrdered()
+local function collectOrdered(myToken)
   ensureCache()
   lastSeen = {}
   local total = Flags.To - Flags.From + 1
   local done = 0
   for num = Flags.From, Flags.To do
+    if cancelled(myToken) then setStatus("Status: stopped") return done end
     setStatus("Status: going to chest " .. num .. " (" .. (done + 1) .. "/" .. total .. ")")
-    collectOneNum(num)
+    collectOneNum(num, myToken)
     done = done + 1
+    if cancelled(myToken) then setStatus("Status: stopped") return done end
     task.wait(Flags.Delay)
+    if cancelled(myToken) then setStatus("Status: stopped") return done end
   end
+  if cancelled(myToken) then setStatus("Status: stopped") return done end
   local left = 0
   for num = Flags.From, Flags.To do
     local e = cache[num]
@@ -432,7 +462,8 @@ local function collectOrdered()
 end
 
 -- legacy nearest-first single pass (kept for the old button).
-local function collectNearestOnce()
+local function collectNearestOnce(myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
   ensureCache()
   local hrp = getHRP()
   local best = nil
@@ -448,8 +479,9 @@ local function collectNearestOnce()
     setStatus("Status: 0 chest(s) in range")
     return 0
   end
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
   setStatus("Status: going to nearest chest " .. best.num)
-  collectOneNum(best.num)
+  collectOneNum(best.num, myToken)
   return 1
 end
 
@@ -508,6 +540,420 @@ local function disablePrompts(chest, on)
   for _, d in ipairs(chest:GetDescendants()) do
     if d.ClassName == "ProximityPrompt" then d.Enabled = on end
   end
+end
+
+-- Inventory GUI: Drop All opens it for now.
+local function getPlayerGui()
+  local pg = nil
+  pcall(function()
+    if LP and LP.FindFirstChild then
+      pg = LP:FindFirstChild("PlayerGui")
+    end
+  end)
+  if pg == nil then
+    pcall(function()
+      if LP then pg = LP.PlayerGui end
+    end)
+  end
+  return pg
+end
+
+local function findInventoryGui()
+  local pg = getPlayerGui()
+  if not pg then return nil end
+  local exact = nil
+  pcall(function() exact = pg:FindFirstChild("Inventory") end)
+  if exact then return exact end
+  local found = nil
+  pcall(function()
+    for _, d in ipairs(pg:GetDescendants()) do
+      if d.Name and string.find(string.lower(d.Name), "inventory") then
+        found = d
+        break
+      end
+    end
+  end)
+  return found
+end
+
+local function setGuiOpen(gui, open)
+  if not gui then return end
+  pcall(function()
+    if gui.ClassName == "ScreenGui" then
+      gui.Enabled = open
+    end
+  end)
+  pcall(function()
+    if gui.IsA and gui:IsA("GuiObject") then
+      gui.Visible = open
+    end
+  end)
+  -- ensure parents are visible/enabled up to PlayerGui
+  pcall(function()
+    local cur = gui.Parent
+    while cur and cur.ClassName ~= "PlayerGui" and cur.ClassName ~= "DataModel" do
+      if cur.IsA and cur:IsA("GuiObject") then cur.Visible = true end
+      if cur.ClassName == "ScreenGui" then cur.Enabled = true end
+      cur = cur.Parent
+    end
+  end)
+end
+
+local function openInventory()
+  local gui = findInventoryGui()
+  if not gui then
+    setStatus("Status: inventory GUI not found")
+    say("Inventory GUI not found (looked for 'Inventory' in PlayerGui)")
+    return false
+  end
+  setGuiOpen(gui, true)
+  setStatus("Status: inventory open")
+  say("Inventory opened")
+  return true
+end
+
+-- Drop spot: while auto drop runs, the player is frozen here, looking downwards.
+local DropSpotX, DropSpotY, DropSpotZ = 298, 17, 207
+
+local function holdDropSpot()
+  pcall(function()
+    local hrp = getHRP()
+    if hrp then
+      hrp.CFrame = CFrame.new(DropSpotX, DropSpotY, DropSpotZ) * CFrame.Angles(-math.pi / 2, 0, 0)
+      hrp.Anchored = true
+    end
+  end)
+end
+
+local function unfreezeNow()
+  pcall(function()
+    local hrp = getHRP()
+    if hrp then hrp.Anchored = false end
+  end)
+end
+
+-- Drop All: priority order, click each item then drop until its count is 0.
+local DropOrder = {"Legendary Arrow", "Shiny Arrow", "Stand Arrow", "Locacaca Fruit"}
+
+-- clicks a GuiButton with every available method. never throws.
+local function clickGui(btn)
+  if btn == nil then return false end
+  local clicked = false
+  pcall(function()
+    if btn.Activate then
+      btn:Activate()
+      clicked = true
+    end
+  end)
+  if clicked then return true end
+  pcall(function()
+    if typeof(firesignal) == "function" and btn.MouseButton1Click then
+      firesignal(btn.MouseButton1Click)
+      clicked = true
+    end
+  end)
+  if clicked then return true end
+  pcall(function()
+    if typeof(firesignal) == "function" and btn.Activated then
+      firesignal(btn.Activated)
+      clicked = true
+    end
+  end)
+  if clicked then return true end
+  pcall(function()
+    if typeof(getconnections) == "function" then
+      for _, sigName in ipairs({"Activated", "MouseButton1Click"}) do
+        local sig = btn[sigName]
+        if sig then
+          for _, c in ipairs(getconnections(sig)) do
+            pcall(function() c:Fire() end)
+            clicked = true
+          end
+        end
+      end
+    end
+  end)
+  return clicked
+end
+
+local function parseSlotCount(slot)
+  local count = 1
+  local foundNumber = false
+  local function scanText(t)
+    if type(t) ~= "string" then return end
+    local m = string.match(t, "[xX]%s*(%d+)")
+    if m then
+      count = tonumber(m)
+      foundNumber = true
+      return
+    end
+    local m2 = string.match(t, "^%s*(%d+)%s*$")
+    if m2 and not foundNumber then
+      count = tonumber(m2)
+      foundNumber = true
+    end
+  end
+  pcall(function() scanText(slot.Text) end)
+  pcall(function()
+    for _, d in ipairs(slot:GetDescendants()) do
+      if d.ClassName == "TextLabel" or d.ClassName == "TextButton" then
+        local t = nil
+        pcall(function() t = d.Text end)
+        scanText(t)
+      end
+    end
+  end)
+  return count
+end
+
+-- returns slot gui + count, or nil when none of this item is left in the inventory
+local function findItemSlot(itemName)
+  local pg = getPlayerGui()
+  if not pg then return nil end
+  local want = string.lower(itemName)
+  local all = nil
+  pcall(function() all = pg:GetDescendants() end)
+  if not all then return nil end
+  for _, d in ipairs(all) do
+    local cls = d.ClassName
+    if cls == "TextButton" or cls == "ImageButton" or cls == "Frame" or cls == "ImageLabel" or cls == "TextLabel" then
+      local match = false
+      pcall(function()
+        if d.Name and string.lower(d.Name) == want then match = true end
+      end)
+      if not match then
+        pcall(function()
+          if d.Text and string.lower(d.Text) == want then match = true end
+        end)
+      end
+      if not match then
+        pcall(function()
+          for _, c in ipairs(d:GetDescendants()) do
+            if c.ClassName == "TextLabel" and c.Text and string.lower(c.Text) == want then
+              match = true
+              break
+            end
+          end
+        end)
+      end
+      if match then
+        return d, parseSlotCount(d)
+      end
+    end
+  end
+  return nil
+end
+
+local function findBackpackTool(itemName)
+  local pack = nil
+  pcall(function()
+    if LP and LP.FindFirstChild then pack = LP:FindFirstChild("Backpack") end
+  end)
+  if not pack then
+    pcall(function() if LP then pack = LP.Backpack end end)
+  end
+  if not pack then return nil end
+  local want = string.lower(itemName)
+  local found = nil
+  pcall(function()
+    for _, c in ipairs(pack:GetChildren()) do
+      if c.Name and string.lower(c.Name) == want then
+        found = c
+        break
+      end
+    end
+  end)
+  return found
+end
+
+local function findDropButton()
+  local pg = getPlayerGui()
+  if not pg then return nil end
+  for _, nm in ipairs({"Drop", "DropItem", "DropAll", "Discard", "Delete", "Trash"}) do
+    local b = nil
+    pcall(function() b = pg:FindFirstChild(nm, true) end)
+    if b then return b end
+  end
+  local all = nil
+  pcall(function() all = pg:GetDescendants() end)
+  if all then
+    for _, d in ipairs(all) do
+      if d.ClassName == "TextButton" or d.ClassName == "ImageButton" then
+        local hit = false
+        pcall(function()
+          if d.Name and string.find(string.lower(d.Name), "drop") then hit = true end
+        end)
+        if not hit then
+          pcall(function()
+            if d.Text and string.find(string.lower(d.Text), "drop") then hit = true end
+          end)
+        end
+        if hit then return d end
+      end
+    end
+  end
+  return nil
+end
+
+local dropRemote = nil
+local warnedNoDropRemote = false
+
+local function resolveDropRemote()
+  local okRs, rs = pcall(function() return game:GetService("ReplicatedStorage") end)
+  if not okRs or not rs then return nil end
+  local all = nil
+  pcall(function() all = rs:GetDescendants() end)
+  if not all then return nil end
+  for _, d in ipairs(all) do
+    if d.ClassName == "RemoteEvent" or d.ClassName == "UnreliableRemoteEvent" or d.ClassName == "RemoteFunction" then
+      local nm = string.lower(d.Name)
+      if string.find(nm, "drop") or string.find(nm, "discard") then return d end
+    end
+  end
+  return nil
+end
+
+local function getDropRemote()
+  if dropRemote and dropRemote.Parent ~= nil then return dropRemote end
+  dropRemote = resolveDropRemote()
+  return dropRemote
+end
+
+local function tryDropRemote(handle, itemName)
+  local rem = getDropRemote()
+  if not rem then
+    if not warnedNoDropRemote then
+      say("No drop remote found - GUI drop only")
+      warnedNoDropRemote = true
+    end
+    return
+  end
+  if rem.ClassName == "RemoteFunction" then
+    if handle then pcall(function() rem:InvokeServer(handle) end)
+    else pcall(function() rem:InvokeServer(itemName) end) end
+  else
+    if handle then pcall(function() rem:FireServer(handle) end) end
+    pcall(function() rem:FireServer(itemName) end)
+  end
+end
+
+-- drops ONE item name until its count is 0. returns true when empty.
+local function dropOneOf(itemName, myToken)
+  local noProgress = 0
+  for attempt = 1, 30 do
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    holdDropSpot()
+    local slot = nil
+    local count = 0
+    local isTool = false
+    local s, c = findItemSlot(itemName)
+    if s then
+      slot = s
+      count = c or 1
+    else
+      local tool = findBackpackTool(itemName)
+      if not tool then
+        return true
+      end
+      slot = tool
+      count = 1
+      isTool = true
+    end
+    setStatus("Status: drop [" .. itemName .. "] (" .. count .. " left)...")
+    if isTool then
+      pcall(function()
+        local char = LP.Character
+        local hum = nil
+        if char then
+          if char.FindFirstChildOfClass then hum = char:FindFirstChildOfClass("Humanoid")
+          else hum = char:FindFirstChild("Humanoid") end
+        end
+        if hum and hum.EquipTool then hum:EquipTool(slot) end
+      end)
+      task.wait(0.3)
+    else
+      clickGui(slot)
+      task.wait(0.4)
+    end
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    -- recount: gone means one click dropped it
+    local s2, c2 = findItemSlot(itemName)
+    local t2 = nil
+    if not s2 then t2 = findBackpackTool(itemName) end
+    if not s2 and not t2 then
+      return true
+    end
+    local left2 = s2 and (c2 or 1) or 1
+    if s2 and left2 < count then
+      noProgress = 0
+    else
+      -- click alone did nothing: use the Drop button, then the remote
+      local dropBtn = findDropButton()
+      if dropBtn then
+        clickGui(dropBtn)
+        task.wait(0.5)
+        if cancelled(myToken) then setStatus("Status: stopped") return false end
+        local s3, c3 = findItemSlot(itemName)
+        local t3 = nil
+        if not s3 then t3 = findBackpackTool(itemName) end
+        if not s3 and not t3 then return true end
+        local left3 = s3 and (c3 or 1) or 1
+        if s3 and left3 < count then
+          noProgress = 0
+        else
+          tryDropRemote(s3 or t3, itemName)
+          task.wait(0.5)
+          local s4, c4 = findItemSlot(itemName)
+          local t4 = nil
+          if not s4 then t4 = findBackpackTool(itemName) end
+          if not s4 and not t4 then return true end
+          local left4 = s4 and (c4 or 1) or 1
+          if s4 and left4 < count then noProgress = 0
+          else noProgress = noProgress + 1 end
+        end
+      else
+        tryDropRemote(s2 or t2, itemName)
+        task.wait(0.5)
+        local s5, c5 = findItemSlot(itemName)
+        local t5 = nil
+        if not s5 then t5 = findBackpackTool(itemName) end
+        if not s5 and not t5 then return true end
+        local left5 = s5 and (c5 or 1) or 1
+        if s5 and left5 < count then noProgress = 0
+        else noProgress = noProgress + 1 end
+      end
+    end
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    if noProgress >= 3 then
+      setStatus("Status: drop [" .. itemName .. "] stuck, moving on")
+      say("Could not drop " .. itemName .. " - leaving it and moving on")
+      return false
+    end
+    task.wait(0.4)
+  end
+  setStatus("Status: drop [" .. itemName .. "] gave up after 30 tries")
+  return false
+end
+
+-- priority order: legendary -> shiny -> stand -> locacaca, each until 0.
+local function dropAllPriority(myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  holdDropSpot()
+  openInventory()
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  local emptied = 0
+  for _, itemName in ipairs(DropOrder) do
+    if cancelled(myToken) then setStatus("Status: stopped") return emptied end
+    setStatus("Status: drop [" .. itemName .. "]...")
+    local ok = dropOneOf(itemName, myToken)
+    if ok then emptied = emptied + 1 end
+    if cancelled(myToken) then setStatus("Status: stopped") return emptied end
+    task.wait(0.3)
+  end
+  if cancelled(myToken) then setStatus("Status: stopped") return emptied end
+  setStatus("Status: drop done - arrows/fruit at 0")
+  say("Drop All done")
+  return emptied
 end
 
 -- VantixUI load (real) or fallback shim (editor mock)
@@ -676,9 +1122,11 @@ local autoToggle = FarmTab:AddToggle({
   Default  = false,
   Callback = function(state)
     Flags.Auto = state
+    sweepToken = sweepToken + 1 -- abort any in-progress sweep so OFF stops immediately
+    if not state then manualRunning = false dropRunning = false unfreezeNow() end
     say("Auto Collect " .. (state and "enabled" or "disabled"))
     Window:Notify({ Title = "Auto Collect", Text = state and "Enabled" or "Disabled", Duration = 2 })
-    setStatus("Status: auto " .. (state and "on (1->54)" or "off"))
+    setStatus(state and "Status: auto on (1->54)" or "Status: stopped")
   end,
 })
 
@@ -756,14 +1204,33 @@ local methodDropdown = FarmTab:AddDropdown({
 
 FarmTab:AddButton({
   Title    = "Collect 1-54 In Order",
-  Subtitle = "One sweep: 1 then 2 then 3...",
+  Subtitle = "One sweep: 1 then 2 then 3... (press again to stop)",
   Icon     = "list-ordered",
   Text     = "Start 1-54",
   Callback = function()
+    if manualRunning then
+      sweepToken = sweepToken + 1
+      manualRunning = false
+      setStatus("Status: stopped")
+      say("Sweep stopped")
+      return
+    end
+    Flags.Auto = false
+    pcall(function() autoToggle:Set(false) end)
+    sweepToken = sweepToken + 1
+    local myToken = sweepToken
+    manualRunning = true
     say("Sweep started: " .. Flags.From .. " -> " .. Flags.To .. " in order")
-    local n = collectOrdered()
-    say("Sweep: visited " .. n .. " chests in order")
-    Window:Notify({ Title = "Done", Text = "Sweep finished", Duration = 3 })
+    task.spawn(function()
+      local n = collectOrdered(myToken)
+      if myToken == sweepToken then manualRunning = false end
+      if cancelled(myToken) then
+        say("Sweep stopped after " .. n .. " chests")
+      else
+        say("Sweep: visited " .. n .. " chests in order")
+        Window:Notify({ Title = "Done", Text = "Sweep finished", Duration = 3 })
+      end
+    end)
   end,
 })
 
@@ -773,8 +1240,27 @@ FarmTab:AddButton({
   Icon     = "mouse-pointer",
   Text     = "Collect",
   Callback = function()
-    local n = collectNearestOnce()
-    say("Nearest pass: " .. n .. " collected")
+    task.spawn(function()
+      local n = collectNearestOnce(nil)
+      say("Nearest pass: " .. n .. " collected")
+    end)
+  end,
+})
+
+FarmTab:AddButton({
+  Title    = "Stop",
+  Subtitle = "Halts auto + any running sweep immediately",
+  Icon     = "square",
+  Text     = "Stop",
+  Callback = function()
+    Flags.Auto = false
+    pcall(function() autoToggle:Set(false) end)
+    sweepToken = sweepToken + 1
+    manualRunning = false
+    dropRunning = false
+    unfreezeNow()
+    setStatus("Status: stopped")
+    say("Stopped")
   end,
 })
 
@@ -823,14 +1309,71 @@ SettingsTab:AddButton({
   Callback = function() Window:Destroy() end,
 })
 
+local DropsTab = Window:AddTab("Drops", "package")
+DropsTab:AddButton({
+  Title    = "Drop All",
+  Subtitle = "Legendary -> Shiny -> Stand -> Locacaca, each to 0 (press again to stop)",
+  Icon     = "package",
+  Text     = "Drop All",
+  Callback = function()
+    if dropRunning then
+      sweepToken = sweepToken + 1
+      dropRunning = false
+      unfreezeNow()
+      setStatus("Status: stopped")
+      say("Drop stopped")
+      return
+    end
+    local wasAuto = Flags.Auto
+    Flags.Auto = false
+    pcall(function() autoToggle:Set(false) end)
+    sweepToken = sweepToken + 1 -- pause farming so the player holds the drop spot
+    local myToken = sweepToken
+    dropRunning = true
+    setStatus("Status: drop started - frozen at drop spot")
+    say("Drop All started: Legendary -> Shiny -> Stand -> Locacaca (frozen at 298, 17, 207)")
+    task.spawn(function()
+      dropAllPriority(myToken)
+      unfreezeNow()
+      if myToken == sweepToken then
+        dropRunning = false
+        if wasAuto then
+          Flags.Auto = true
+          pcall(function() autoToggle:Set(true) end)
+          setStatus("Status: auto on (1->54) - resumed after drop")
+          say("Drop done - farming resumed")
+        end
+      end
+    end)
+  end,
+})
+
+local AboutTab = Window:AddTab("About", "info")
+AboutTab:AddLabel("Join us, its a small or maybe a server with 1-2 people it would be nice if you joined")
+AboutTab:AddButton({
+  Title    = "Discord Server",
+  Subtitle = "https://discord.gg/fTDNhTsnN6",
+  Icon     = "link",
+  Text     = "Copy Invite",
+  Callback = function()
+    pcall(function()
+      if setclipboard then setclipboard("https://discord.gg/fTDNhTsnN6") end
+    end)
+    say("Discord: https://discord.gg/fTDNhTsnN6")
+    Window:Notify({ Title = "Discord", Text = "Invite copied (link also in log)", Duration = 3 })
+  end,
+})
+
 task.spawn(function()
   if FALLBACK then return end
   while true do
     if Flags.Auto then
+      -- OFF bumps the token, which aborts this sweep at its next checkpoint
+      local myToken = sweepToken
       if Flags.InOrder then
-        collectOrdered()
+        collectOrdered(myToken)
       else
-        collectNearestOnce()
+        collectNearestOnce(myToken)
       end
     end
     task.wait(math.max(0.5, Flags.Delay))
@@ -866,8 +1409,62 @@ if FALLBACK then
     print("Demo: chest 9 just streamed in.")
     collectOneNum(9)
   end
+  -- demo inventory GUI (hidden) with droppable slots so Drop All can be watched
+  pcall(function()
+    local demoPg = Instance.new("PlayerGui")
+    demoPg.Name = "PlayerGui"
+    LP.PlayerGui = demoPg
+    local inv = Instance.new("ScreenGui")
+    inv.Name = "Inventory"
+    inv.Enabled = false
+    inv.Parent = demoPg
+    local list = Instance.new("Frame")
+    list.Name = "ItemList"
+    list.Parent = inv
+    local function demoItem(name, n)
+      local b = Instance.new("TextButton")
+      b.Name = name
+      b.Text = name
+      b.Parent = list
+      local c = Instance.new("TextLabel")
+      c.Name = "Count"
+      c.Text = "x" .. n
+      c.Parent = b
+      b.Activate = function(self)
+        local left = n
+        pcall(function()
+          left = tonumber(string.match(c.Text, "%d+")) or n
+        end)
+        left = left - 1
+        if left <= 0 then
+          b.Parent = nil
+        else
+          c.Text = "x" .. left
+        end
+      end
+    end
+    demoItem("Legendary Arrow", 2)
+    demoItem("Stand Arrow", 1)
+    local drop = Instance.new("TextButton")
+    drop.Name = "Drop"
+    drop.Text = "Drop"
+    drop.Parent = inv
+  end)
+  print("Demo: dropping arrows/fruit like Drop All does (frozen at 298, 17, 207).")
+  holdDropSpot()
+  print("Demo: frozen = " .. tostring(getHRP().Anchored) .. " at " .. tostring(getHRP().Position))
+  dropAllPriority(nil)
+  unfreezeNow()
+  print("Demo: unfrozen = " .. tostring(not getHRP().Anchored))
   print("Demo done: " .. uniqueOpened .. " unique chests, " .. totalOpens .. " total opens.")
 end
 
 -- handle for driving / testing the collector
-ChestCollector = { Flags = Flags, collectOneNum = collectOneNum, collectOrdered = collectOrdered, findChestByNum = findChestByNum, getHRP = getHRP }
+ChestCollector = { Flags = Flags, collectOneNum = collectOneNum, collectOrdered = collectOrdered, collectNearestOnce = collectNearestOnce, findChestByNum = findChestByNum, getHRP = getHRP, openInventory = openInventory, dropAll = dropAllPriority,
+  stop = function()
+    Flags.Auto = false
+    pcall(function() autoToggle:Set(false) end)
+    sweepToken = sweepToken + 1
+    manualRunning = false
+    setStatus("Status: stopped")
+  end }
