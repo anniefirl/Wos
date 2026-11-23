@@ -1,16 +1,516 @@
 -- Chest Collector 1-54 (VantixUI style)
--- Collects numbered chests ("1" .. "54") like the models in your place file.
--- Handles both kinds: chests that never come back AND chests that respawn.
--- A respawn is detected when a chest becomes available again, then re-collected.
--- Opened through the OpenChest remote, found via each chest's ProximityPrompt.
--- Instant: zeroes each prompt's HoldDuration, no T-hold needed.
--- Streaming: remembers positions and walks back to chests whose area isn't rendered.
+-- Goes in order: 1 then 2 then 3 ... up to To. No nearest-first, no repeats.
+-- Collects numbered chests ("1" .. "54").
+-- Primary method is the chest's own ProximityPrompt (fireproximityprompt):
+-- that lets the game's own server script run, so no remote name guessing needed.
+-- A RemoteEvent/RemoteFunction fallback is still tried if the prompt alone fails.
+-- Status + counter update on EVERY chest (with print fallback so you always see it).
+-- Each chest gets max 3 tries, then we move on - never stuck on one chest.
+-- Streaming: remembers positions and walks back to unstreamed chests.
 -- Works in a real executor (loads the real VantixUI) and in this editor
 -- (falls back to a built-in shim that mirrors the same calls).
 -- Strict Luau subset (no +=, no continue): runs on stock Lua 5.3 too.
 
-local OPEN_REMOTE_NAME = "OpenChest"
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
 
+local Flags = { Auto = false, Radius = 1000, Delay = 0.5, Method = "Teleport",
+  From = 1, To = 54, Collected = 0, RemoteName = "OpenChest", InOrder = true,
+  MaxTries = 3 }
+
+local memory = {}      -- [num] = last seen position (for unstreamed chests)
+local lastSeen = {}    -- nums present in the latest scan
+local openedSet = {}   -- nums opened at least once
+local uniqueOpened = 0
+local totalOpens = 0
+local warnedNoRemote = false
+
+-- created by the UI below, callbacks only use them later
+local status = nil
+local countLabel = nil
+local console = nil
+local openRemote = nil
+
+local function say(msg)
+  print(msg)
+  if console then pcall(function() console:Write(msg) end) end
+end
+
+local function setStatus(msg)
+  print(msg)
+  if status then
+    pcall(function() status:Set(msg) end)
+  end
+  if console then pcall(function() console:Write(msg) end) end
+end
+
+local function refreshCounter()
+  local msg = "Opened: " .. uniqueOpened .. " / " .. math.max(1, Flags.To - Flags.From + 1) .. " (" .. totalOpens .. " total)"
+  if countLabel then pcall(function() countLabel:Set(msg) end) end
+  print(msg)
+end
+
+local function getHRP()
+  local char = LP.Character
+  if char then
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then return hrp end
+  end
+  char = Instance.new("Model")
+  char.Name = LP.Name or "Player1"
+  local hrp = Instance.new("Part")
+  hrp.Name = "HumanoidRootPart"
+  hrp.Position = Vector3.new(0, 5, 0)
+  hrp.Anchored = true
+  hrp.Parent = char
+  char.Parent = workspace
+  LP.Character = char
+  return hrp
+end
+
+local function chestNum(model)
+  if model == nil or model.Name == nil then return nil end
+  local n = tonumber(model.Name)
+  if n and n >= Flags.From and n <= Flags.To then return n end
+  return nil
+end
+
+local function dist3(a, b)
+  local dx = a.X - b.X
+  local dy = a.Y - b.Y
+  local dz = a.Z - b.Z
+  return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+-- cache: [num] = { model=, prompt=, opened=, part= }
+local cache = {}
+local cacheReady = false
+
+local function firstOf(model, className)
+  for _, x in ipairs(model:GetDescendants()) do
+    if x.ClassName == className then return x end
+  end
+  return nil
+end
+
+local function modelOf(node)
+  local cur = node
+  for _ = 1, 4 do
+    if cur == nil then return nil end
+    if cur.ClassName == "Model" and tonumber(cur.Name) then return cur end
+    if cur.Name and tonumber(cur.Name) and cur.FindFirstChild then
+      local ok, has = pcall(function() return cur:FindFirstChild("Opened") end)
+      if ok and has then return cur end
+    end
+    cur = cur.Parent
+  end
+  return nil
+end
+
+local function entryFor(model)
+  if model == nil then return nil end
+  local num = tonumber(model.Name)
+  if not num then return nil end
+  local prompt = firstOf(model, "ProximityPrompt")
+  if not prompt then return nil end
+  local part = model:FindFirstChild("ChestPart", true) or firstOf(model, "Part")
+  if not part then part = prompt.Parent end
+  local opened = nil
+  pcall(function() opened = model:FindFirstChild("Opened") end)
+  return { model = model, num = num, prompt = prompt, part = part, opened = opened }
+end
+
+local function cacheAdd(model)
+  local e = entryFor(model)
+  if e then cache[e.num] = e end
+end
+
+local function buildCache()
+  cache = {}
+  local all = workspace:GetDescendants()
+  for _, d in ipairs(all) do
+    if d.ClassName == "ProximityPrompt" then
+      local m = modelOf(d)
+      if m then cacheAdd(m) end
+    end
+  end
+  -- also accept numeric models even if prompt search missed
+  for _, d in ipairs(all) do
+    if d.ClassName == "Model" and tonumber(d.Name) then
+      local n = tonumber(d.Name)
+      if cache[n] == nil then cacheAdd(d) end
+    end
+  end
+  local n = 0
+  for _ in pairs(cache) do n = n + 1 end
+  say("Chest cache: " .. n .. " chests tracked")
+end
+
+local function registerCacheHandlers()
+  if cacheReady then return end
+  cacheReady = true
+  workspace.DescendantAdded:Connect(function(d)
+    if d.ClassName == "ProximityPrompt" then
+      local m = modelOf(d)
+      if m then cacheAdd(m) end
+    elseif d.ClassName == "Model" and tonumber(d.Name) then
+      cacheAdd(d)
+    end
+  end)
+  workspace.DescendantRemoving:Connect(function(d)
+    if d.ClassName == "Model" and tonumber(d.Name) then
+      local n = tonumber(d.Name)
+      cache[n] = nil
+    end
+  end)
+end
+
+local function ensureCache()
+  if not cacheReady then buildCache() registerCacheHandlers() end
+end
+
+-- fresh lookup for ONE number: cache first, then a full scan (handles folders).
+local function findChestByNum(num)
+  ensureCache()
+  local e = cache[num]
+  if e and e.model.Parent ~= nil and e.prompt and e.prompt.Parent ~= nil then
+    if e.part and e.part.Position then
+      memory[num] = e.part.Position
+      lastSeen[num] = true
+      return e
+    end
+  end
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d.ClassName == "ProximityPrompt" then
+      local m = modelOf(d)
+      if m and tonumber(m.Name) == num then
+        cacheAdd(m)
+        local e2 = cache[num]
+        if e2 and e2.part and e2.part.Position then
+          memory[num] = e2.part.Position
+          lastSeen[num] = true
+          return e2
+        end
+        return e2
+      end
+    end
+  end
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d.ClassName == "Model" and tonumber(d.Name) == num then
+      cacheAdd(d)
+      local e2 = cache[num]
+      if e2 then
+        if e2.part and e2.part.Position then memory[num] = e2.part.Position end
+        lastSeen[num] = true
+        return e2
+      end
+      return entryFor(d)
+    end
+  end
+  return nil
+end
+
+local function isOpened(e)
+  if e == nil then return false end
+  if e.opened and e.opened.Value == true then return true end
+  -- re-read in case the value instance changed
+  local ok, o = pcall(function() return e.model:FindFirstChild("Opened") end)
+  if ok and o and o.Value == true then
+    e.opened = o
+    return true
+  end
+  if e.prompt and e.prompt.Enabled == false then
+    -- disabled prompt usually means already taken; treat as done so we move on
+    return true
+  end
+  return false
+end
+
+-- remote resolution: exact name first, then auto-detect chest remotes.
+local function resolveRemote()
+  local want = (Flags.RemoteName ~= "" and Flags.RemoteName) or "OpenChest"
+  local okRs, rs = pcall(function() return game:GetService("ReplicatedStorage") end)
+  if not okRs or not rs then return nil end
+  local direct = rs:FindFirstChild(want, true)
+  if direct and (direct.ClassName == "RemoteEvent" or direct.ClassName == "UnreliableRemoteEvent" or direct.ClassName == "RemoteFunction") then
+    return direct
+  end
+  for _, d in ipairs(rs:GetDescendants()) do
+    if d.ClassName == "RemoteEvent" or d.ClassName == "UnreliableRemoteEvent" then
+      local nm = string.lower(d.Name)
+      if string.find(nm, "chest") or string.find(nm, "open") or string.find(nm, "loot") then return d end
+    end
+  end
+  return nil
+end
+
+local function getRemote()
+  if openRemote and openRemote.Parent ~= nil then return openRemote end
+  openRemote = resolveRemote()
+  if openRemote then say("Remote: " .. tostring(openRemote.Name)) end
+  return openRemote
+end
+
+-- instant collect core: zero the hold time, then fire the prompt itself.
+-- never throws. returns true if a fire was attempted.
+local function holdPrompt(prompt)
+  pcall(function()
+    prompt.HoldDuration = 0
+    prompt.MaxActivationDistance = 1000
+    prompt.RequiresLineOfSight = false
+    prompt.Enabled = true
+  end)
+  if typeof(fireproximityprompt) == "function" then
+    local ok = pcall(fireproximityprompt, prompt)
+    if ok then return true end
+  end
+  if prompt.Triggered and typeof(prompt.Triggered.Fire) == "function" then
+    pcall(function() prompt.Triggered:Fire(LP) end)
+    return true
+  end
+  -- last resort: InputHoldBegin/End (some executors expose these)
+  pcall(function()
+    if prompt.InputHoldBegin then prompt:InputHoldBegin() end
+  end)
+  task.wait(0.1)
+  pcall(function()
+    if prompt.InputHoldEnd then prompt:InputHoldEnd() end
+  end)
+  return true
+end
+
+local function tryRemoteFallback(chestModel, num, attempt)
+  local rem = getRemote()
+  if not rem then
+    if not warnedNoRemote then
+      say("No chest remote found - prompt-only mode (this is fine, game server handles the prompt)")
+      warnedNoRemote = true
+    end
+    return
+  end
+  -- one payload per attempt so the server log stays clean:
+  -- try 1 = chest model (most common), try 2 = number, try 3 = string.
+  -- the prompt fire above is always tried first; this is only a fallback.
+  if rem.ClassName == "RemoteFunction" then
+    pcall(function() rem:InvokeServer(chestModel) end)
+    return
+  end
+  if attempt == 2 then
+    pcall(function() rem:FireServer(num) end)
+  elseif attempt == 3 then
+    pcall(function() rem:FireServer(tostring(num)) end)
+  else
+    pcall(function() rem:FireServer(chestModel) end)
+  end
+end
+
+local function gotoPosition(pos, method)
+  local hrp = getHRP()
+  if not hrp then return end
+  if method == "Tween" then
+    local from = hrp.Position
+    for i = 1, 10 do
+      local t = i / 10
+      hrp.CFrame = CFrame.new(
+        from.X + (pos.X - from.X) * t,
+        from.Y + (pos.Y - from.Y) * t + 3,
+        from.Z + (pos.Z - from.Z) * t)
+      task.wait(0.05)
+    end
+  else
+    hrp.CFrame = CFrame.new(pos.X, pos.Y + 3, pos.Z)
+  end
+end
+
+-- walk back to a remembered chest whose area isn't rendered.
+local function visitRemembered(num, pos)
+  local hrp = getHRP()
+  if not hrp then return nil end
+  setStatus("Status: [" .. num .. "] area not rendered, walking back...")
+  hrp.CFrame = CFrame.new(pos.X, pos.Y + 3, pos.Z)
+  if typeof(LP.RequestStreamAroundAsync) == "function" then
+    pcall(function() LP:RequestStreamAroundAsync(pos) end)
+  end
+  for _ = 1, 10 do
+    task.wait(0.5)
+    local e = findChestByNum(num)
+    if e and e.prompt and e.part and e.part.Position then
+      say("Chest " .. num .. " streamed in")
+      return e
+    end
+  end
+  say("Chest " .. num .. " did not stream in, will retry later")
+  return nil
+end
+
+-- collect ONE numbered chest. always moves on after MaxTries. returns true if opened.
+local function collectOneNum(num)
+  local e = findChestByNum(num)
+  if not e then
+    local mem = memory[num]
+    if mem then
+      e = visitRemembered(num, mem)
+    end
+  end
+  if not e then
+    setStatus("Status: [" .. num .. "] not found, skipping")
+    return false
+  end
+  if e.part == nil or e.part.Position == nil then
+    setStatus("Status: [" .. num .. "] has no position, skipping")
+    return false
+  end
+  if isOpened(e) then
+    setStatus("Status: [" .. num .. "] already opened, skipping")
+    return true
+  end
+  memory[num] = e.part.Position
+  gotoPosition(e.part.Position, Flags.Method)
+  task.wait(0.25)
+  for attempt = 1, Flags.MaxTries do
+    setStatus("Status: [" .. num .. "] opening (try " .. attempt .. "/" .. Flags.MaxTries .. ")...")
+    holdPrompt(e.prompt)
+    task.wait(0.6)
+    -- re-read opened state: prompt path alone is often enough
+    if isOpened(e) then
+      if not openedSet[num] then openedSet[num] = true uniqueOpened = uniqueOpened + 1 end
+      totalOpens = totalOpens + 1
+      Flags.Collected = totalOpens
+      refreshCounter()
+      setStatus("Status: [" .. num .. "] opened! (" .. uniqueOpened .. " unique)")
+      say("Opened chest " .. num)
+      return true
+    end
+    -- prompt alone failed: try the remote fallback once, then check again
+    tryRemoteFallback(e.model, num, attempt)
+    task.wait(0.5)
+    -- re-read opened state
+    if isOpened(e) then
+      if not openedSet[num] then openedSet[num] = true uniqueOpened = uniqueOpened + 1 end
+      totalOpens = totalOpens + 1
+      Flags.Collected = totalOpens
+      refreshCounter()
+      setStatus("Status: [" .. num .. "] opened! (" .. uniqueOpened .. " unique)")
+      say("Opened chest " .. num)
+      return true
+    end
+    -- prompt may have been replaced; re-resolve once
+    if attempt < Flags.MaxTries then
+      task.wait(0.3)
+      local fresh = findChestByNum(num)
+      if fresh then e = fresh end
+    end
+  end
+  setStatus("Status: [" .. num .. "] did not open after " .. Flags.MaxTries .. " tries, moving on")
+  return false
+end
+
+-- THE sweep: strict numeric order From -> To. never repeats a chest in one sweep.
+local function collectOrdered()
+  ensureCache()
+  lastSeen = {}
+  local total = Flags.To - Flags.From + 1
+  local done = 0
+  for num = Flags.From, Flags.To do
+    setStatus("Status: going to chest " .. num .. " (" .. (done + 1) .. "/" .. total .. ")")
+    collectOneNum(num)
+    done = done + 1
+    task.wait(Flags.Delay)
+  end
+  local left = 0
+  for num = Flags.From, Flags.To do
+    local e = cache[num]
+    if e and not isOpened(e) then left = left + 1 end
+  end
+  if left == 0 then
+    setStatus("Status: sweep done - all chests opened!")
+  else
+    setStatus("Status: sweep done - " .. left .. " chest(s) still closed, run again")
+  end
+  return done
+end
+
+-- legacy nearest-first single pass (kept for the old button).
+local function collectNearestOnce()
+  ensureCache()
+  local hrp = getHRP()
+  local best = nil
+  local bestD = 1e9
+  for num = Flags.From, Flags.To do
+    local e = findChestByNum(num)
+    if e and not isOpened(e) and e.part and e.part.Position then
+      local d = dist3(hrp.Position, e.part.Position)
+      if d <= Flags.Radius and d < bestD then bestD = d best = e end
+    end
+  end
+  if not best then
+    setStatus("Status: 0 chest(s) in range")
+    return 0
+  end
+  setStatus("Status: going to nearest chest " .. best.num)
+  collectOneNum(best.num)
+  return 1
+end
+
+local function hasAnyPrompt()
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d.ClassName == "ProximityPrompt" then return true end
+  end
+  return false
+end
+
+local demoHidden9 = nil
+local function makeDemoChest(i)
+  local m = Instance.new("Model")
+  m.Name = tostring(i)
+  local part = Instance.new("Part")
+  part.Name = "ChestPart"
+  part.Position = Vector3.new(-60 + i * 16, 3, (i % 2) * 30 - 15)
+  part.Anchored = true
+  part.Parent = m
+  local opened = Instance.new("BoolValue")
+  opened.Name = "Opened"
+  opened.Value = false
+  opened.Parent = m
+  local prompt = Instance.new("ProximityPrompt")
+  prompt.HoldDuration = 0.5
+  prompt.MaxActivationDistance = 10
+  prompt.Parent = part
+  return m
+end
+local function buildDemoWorld()
+  for i = 1, 8 do
+    makeDemoChest(i).Parent = workspace
+  end
+  demoHidden9 = makeDemoChest(9)
+  print("Demo world: chests 1..8 placed (stand-ins for your 1..54)")
+end
+
+local function findModelByNum(n)
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d.ClassName == "Model" and tonumber(d.Name) == n then return d end
+  end
+  return nil
+end
+
+local function ensureDemoRemote()
+  local r = ReplicatedStorage:FindFirstChild("OpenChest")
+  if not r then
+    r = Instance.new("RemoteEvent")
+    r.Name = "OpenChest"
+    r.Parent = ReplicatedStorage
+  end
+  openRemote = r
+end
+
+local function disablePrompts(chest, on)
+  for _, d in ipairs(chest:GetDescendants()) do
+    if d.ClassName == "ProximityPrompt" then d.Enabled = on end
+  end
+end
+
+-- VantixUI load (real) or fallback shim (editor mock)
 local VantixUI = nil
 do
   local ok, lib = pcall(function()
@@ -24,7 +524,6 @@ end
 local FALLBACK = (VantixUI == nil)
 
 if FALLBACK then
-  -- Minimal Vantix-compatible shim: same calls, logged to the Output panel.
   local function newSignal()
     local sig = { _cons = {} }
     function sig:Connect(fn)
@@ -88,393 +587,19 @@ if FALLBACK then
   VantixUI = ui
 end
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local LP = Players.LocalPlayer
-
-local Flags = { Auto = false, Radius = 200, Delay = 0.5, Method = "Teleport",
-  From = 1, To = 54, Collected = 0, RemoteName = "OpenChest" }
-
-local avail = {}       -- [num] = last seen state: nil unknown, true available, false gone, "tried" fired, waiting
-local memory = {}      -- [num] = last seen position (lets us walk back to unstreamed chests)
-local lastSeen = {}    -- nums present in the latest scan, available or not
-local openedSet = {}   -- nums opened at least once
-local uniqueOpened = 0
-local totalOpens = 0
-
--- created by the UI below, callbacks only use them later
-local status, countLabel, console
-local openRemote
-local getRemote -- forward: defined with the resolver below, used by collectOne above it
-
-local function getHRP()
-  local char = LP.Character
-  if char then
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if hrp then return hrp end
-  end
-  char = Instance.new("Model")
-  char.Name = LP.Name or "Player1"
-  local hrp = Instance.new("Part")
-  hrp.Name = "HumanoidRootPart"
-  hrp.Position = Vector3.new(0, 5, 0)
-  hrp.Anchored = true
-  hrp.Parent = char
-  char.Parent = workspace
-  LP.Character = char
-  return hrp
-end
-
-local function chestNum(model)
-  local n = tonumber(model.Name)
-  if n and n >= Flags.From and n <= Flags.To then return n end
-  return nil
-end
-
-local function chestOf(prompt)
-  local node = prompt.Parent
-  for _ = 1, 3 do
-    if node == nil then return nil end
-    if node.FindFirstChild and node:FindFirstChild("Opened") then return node end
-    if node.Name and chestNum(node) then return node end
-    node = node.Parent
-  end
-  return nil
-end
-
-local function dist3(a, b)
-  local dx = a.X - b.X
-  local dy = a.Y - b.Y
-  local dz = a.Z - b.Z
-  return math.sqrt(dx * dx + dy * dy + dz * dz)
-end
-
-local function rangeSize()
-  return math.max(1, Flags.To - Flags.From + 1)
-end
-
--- Event-driven chest cache: one full scan, then incremental updates.
--- This replaces scanning the whole workspace every pass (the old lag source).
-local cache = {} -- [num] = { model=, prompt=, opened=, part= }
-local cacheReady = false
-local function firstOf(model, className)
-  for _, x in ipairs(model:GetDescendants()) do
-    if x.ClassName == className then return x end
-  end
-  return nil
-end
-local function modelOf(node)
-  local cur = node
-  for _ = 1, 4 do
-    if cur == nil then return nil end
-    if cur.ClassName == "Model" and chestNum(cur) then return cur end
-    cur = cur.Parent
-  end
-  return nil
-end
-local function cacheAdd(model)
-  local num = chestNum(model)
-  if not num then return end
-  local part = model:FindFirstChild("ChestPart", true) or firstOf(model, "Part")
-  cache[num] = {
-    model = model, num = num, part = part,
-    prompt = firstOf(model, "ProximityPrompt"),
-    opened = model:FindFirstChild("Opened"),
-  }
-end
-local function cacheRemoveNum(num)
-  cache[num] = nil
-  avail[num] = false
-end
-local function buildCache()
-  cache = {}
-  for _, d in ipairs(workspace:GetDescendants()) do
-    if d.ClassName == "Model" and chestNum(d) then cacheAdd(d) end
-  end
-  local n = 0
-  for _ in pairs(cache) do n = n + 1 end
-  print("Chest cache: " .. n .. " chests tracked")
-end
-local function registerCacheHandlers()
-  if cacheReady then return end
-  cacheReady = true
-  workspace.DescendantAdded:Connect(function(d)
-    local m = modelOf(d)
-    if m then cacheAdd(m) end
-  end)
-  workspace.DescendantRemoving:Connect(function(d)
-    local m = nil
-    if d.ClassName == "Model" and chestNum(d) then
-      m = d
-    else
-      local cur = d.Parent
-      for _ = 1, 4 do
-        if cur == nil then break end
-        if cur.ClassName == "Model" and chestNum(cur) then m = cur break end
-        cur = cur.Parent
-      end
-    end
-    if m then
-      local n = chestNum(m)
-      if n then cacheRemoveNum(n) end
-    end
-  end)
-end
-
--- One scan doubles as respawn detector: anything that was gone and is back
--- gets collected again; one-and-done chests stay untouched once opened.
-local function findChests()
-  local out = {}
-  lastSeen = {}
-  if not cacheReady then buildCache() registerCacheHandlers() end
-  local hrp = getHRP()
-  if not hrp then return out end
-  for num, e in pairs(cache) do
-    if e.model.Parent ~= nil and e.prompt and e.part and e.part.Position then
-      lastSeen[num] = true
-      memory[num] = e.part.Position
-      local promptOn = (e.prompt.Enabled ~= false)
-      local available = promptOn and ((e.opened == nil) or (not e.opened.Value))
-      local last = avail[num]
-      if available then
-        local entry = { prompt = e.prompt, chest = e.model, num = num, part = e.part,
-          dist = dist3(hrp.Position, e.part.Position) }
-          if last == nil or last == false then
-            if last == false and console then
-              console:Write("Chest " .. num .. " respawned")
-            end
-            out[#out + 1] = entry
-            avail[num] = (e.opened ~= nil) and "tried" or true
-          elseif last == "tried" then
-            if e.opened ~= nil and not e.opened.Value then
-              out[#out + 1] = entry -- server didn't open it last pass, retry
-            else
-              avail[num] = true
-            end
-          end
-        else
-          avail[num] = false
-        end
-    end
-  end
-  table.sort(out, function(a, b) return a.dist < b.dist end)
-  -- in-range filter last so availability memory stays fresh for everything
-  local inRange = {}
-  for _, c in ipairs(out) do
-    if c.dist <= Flags.Radius then inRange[#inRange + 1] = c end
-  end
-  return inRange
-end
-
--- instant collect: zero the hold time, then fire. never throws: if the
--- prompt can't be fired on this client, the remote call below still runs.
-local function holdPrompt(prompt)
-  pcall(function()
-    prompt.HoldDuration = 0
-    prompt.MaxActivationDistance = 1000
-  end)
-  if typeof(fireproximityprompt) == "function" then
-    pcall(fireproximityprompt, prompt)
-  elseif prompt.Triggered and typeof(prompt.Triggered.Fire) == "function" then
-    pcall(function() prompt.Triggered:Fire(LP) end)
-  end
-end
-
-local function collectOne(c)
-  local hrp = getHRP()
-  if not hrp then return false end
-  local p = c.part.Position
-  if Flags.Method == "Tween" then
-    local from = hrp.Position
-    for i = 1, 10 do
-      local t = i / 10
-      hrp.CFrame = CFrame.new(
-        from.X + (p.X - from.X) * t,
-        from.Y + (p.Y - from.Y) * t + 3,
-        from.Z + (p.Z - from.Z) * t)
-      task.wait(0.05)
-    end
-  else
-    hrp.CFrame = CFrame.new(p.X, p.Y + 3, p.Z)
-  end
-  if status then status:Set("Status: opening chest " .. c.num) end
-  task.wait(0.2)
-  holdPrompt(c.prompt)
-  local rem = getRemote()
-  if not rem then
-    if console and not warnedNoRemote then
-      console:Write("No chest remote found - set Remote Name or press Rebuild")
-      warnedNoRemote = true
-    end
-    return false
-  end
-  rem:FireServer(c.chest)
-  return true
-end
-
-local visitRemembered -- forward: defined below, used by collectPass
-local function collectPass(onlyNearest)
-  local list = findChests()
-  if status then status:Set("Status: " .. #list .. " chest(s) in range") end
-  local n = 0
-  for i, c in ipairs(list) do
-    if onlyNearest and i > 1 then break end
-    collectOne(c)
-    n = n + 1
-    task.wait(Flags.Delay)
-  end
-  -- phase 2: walk back to remembered chests that aren't rendered right now
-  if not onlyNearest then
-    local missing = {}
-    for num, pos in pairs(memory) do
-      if not lastSeen[num] and num >= Flags.From and num <= Flags.To then
-        missing[#missing + 1] = { num = num, pos = pos }
-      end
-    end
-    table.sort(missing, function(a, b) return a.num < b.num end)
-    for _, m in ipairs(missing) do
-      if status then status:Set("Status: checking unstreamed chest " .. m.num) end
-      visitRemembered(m.num, m.pos)
-    end
-  end
-  return n
-end
-
--- walk back to a remembered chest whose area isn't rendered: teleport over,
--- ask the server to stream the area in, wait for it, then collect.
--- waits on the cache (fed by DescendantAdded), never on full workspace scans.
-visitRemembered = function(num, pos)
-  local hrp = getHRP()
-  if not hrp then return end
-  hrp.CFrame = CFrame.new(pos.X, pos.Y + 3, pos.Z)
-  if typeof(LP.RequestStreamAroundAsync) == "function" then
-    LP:RequestStreamAroundAsync(pos)
-  end
-  for _ = 1, 10 do
-    task.wait(0.5)
-    local e = cache[num]
-    if e and e.prompt and e.part and e.part.Position then
-      local promptOn = (e.prompt.Enabled ~= false)
-      if promptOn and ((e.opened == nil) or (not e.opened.Value)) then
-        if console then console:Write("Chest " .. num .. " streamed in") end
-        collectOne({ prompt = e.prompt, chest = e.model, num = num, part = e.part, dist = 0 })
-        task.wait(Flags.Delay)
-        return
-      elseif e.opened ~= nil and e.opened.Value then
-        return -- streamed, but already opened: nothing to do
-      end
-    end
-  end
-  if console then console:Write("Chest " .. num .. " did not stream in, will retry") end
-end
-
-local function hasAnyPrompt()
-  for _, d in ipairs(workspace:GetDescendants()) do
-    if d.ClassName == "ProximityPrompt" then return true end
-  end
-  return false
-end
-
-local demoHidden9 = nil
-local function makeDemoChest(i)
-  local m = Instance.new("Model")
-  m.Name = tostring(i)
-  local part = Instance.new("Part")
-  part.Name = "ChestPart"
-  part.Position = Vector3.new(-60 + i * 16, 3, (i % 2) * 30 - 15)
-  part.Anchored = true
-  part.Parent = m
-  local opened = Instance.new("BoolValue")
-  opened.Name = "Opened"
-  opened.Value = false
-  opened.Parent = m
-  local prompt = Instance.new("ProximityPrompt")
-  prompt.HoldDuration = 0.5
-  prompt.MaxActivationDistance = 10
-  prompt.Parent = part
-  return m
-end
-local function buildDemoWorld()
-  -- numbered chests 1..8, mirrored on the real 1..54 layout
-  for i = 1, 8 do
-    makeDemoChest(i).Parent = workspace
-  end
-  -- chest 9 starts unstreamed (no parent): discovered later in the demo
-  demoHidden9 = makeDemoChest(9)
-  print("Demo world: chests 1..8 placed (stand-ins for your 1..54)")
-end
-
-local function findModelByNum(n)
-  for _, d in ipairs(workspace:GetDescendants()) do
-    if d.ClassName == "Model" and tonumber(d.Name) == n then return d end
-  end
-  return nil
-end
-
--- remote resolution: exact name first, then auto-detect chest remotes.
--- the real game's remote may not be called exactly "OpenChest".
-local warnedNoRemote = false
-local function resolveRemote()
-  local rs = game:GetService("ReplicatedStorage")
-  local want = (Flags.RemoteName ~= "" and Flags.RemoteName) or OPEN_REMOTE_NAME
-  local direct = rs:FindFirstChild(want, true)
-  if direct and (direct.ClassName == "RemoteEvent" or direct.ClassName == "UnreliableRemoteEvent") then
-    return direct
-  end
-  for _, d in ipairs(rs:GetDescendants()) do
-    if d.ClassName == "RemoteEvent" or d.ClassName == "UnreliableRemoteEvent" then
-      if string.find(string.lower(d.Name), "chest") then return d end
-    end
-  end
-  return nil
-end
-getRemote = function()
-  if openRemote then return openRemote end
-  openRemote = resolveRemote()
-  if openRemote and console then
-    console:Write("Remote: " .. tostring(openRemote.Name))
-  end
-  return openRemote
-end
-local function ensureDemoRemote()
-  local r = ReplicatedStorage:FindFirstChild(OPEN_REMOTE_NAME)
-  if not r then
-    r = Instance.new("RemoteEvent")
-    r.Name = OPEN_REMOTE_NAME
-    r.Parent = ReplicatedStorage
-  end
-  openRemote = r
-end
-
-local function disablePrompts(chest, on)
-  for _, d in ipairs(chest:GetDescendants()) do
-    if d.ClassName == "ProximityPrompt" then d.Enabled = on end
-  end
-end
-
-local function refreshCounter()
-  if countLabel then
-    countLabel:Set("Opened: " .. uniqueOpened .. " / " .. rangeSize() .. " (" .. totalOpens .. " total)")
-  end
-end
-
 if FALLBACK then
-  -- demo "game server" so the full open loop runs inside the mock.
-  -- in the real game the actual server owns this logic.
+  -- demo "game server": opening happens through the PROMPT, like the real game.
+  -- NOTE: the server only flips Opened + disables the prompt. Counting lives
+  -- in collectOneNum so we never double-count in the mock.
   ensureDemoRemote()
-  local demoRem = getRemote()
-  if demoRem then
-  demoRem.OnServerEvent:Connect(function(player, chest)
+  local function serverOpen(player, chest)
     if typeof(chest) ~= "Instance" or not chest.FindFirstChild then
-      print("Server: rejected bad request from " .. tostring(player.Name))
       return
     end
-    local opened = chest:FindFirstChild("Opened")
-    if not opened or opened.Value then
-      print("Server: chest " .. tostring(chest.Name) .. " already opened, ignoring")
+    local ok, opened = pcall(function() return chest:FindFirstChild("Opened") end)
+    if not ok or not opened or opened.Value then
       return
     end
-    -- server-side range check (a real game checks player.Character here)
     local hrp = getHRP()
     local part = chest:FindFirstChild("ChestPart", true)
     if hrp and part then
@@ -485,15 +610,49 @@ if FALLBACK then
     end
     opened.Value = true
     disablePrompts(chest, false)
-    local num = tonumber(chest.Name) or 0
-    if not openedSet[num] then openedSet[num] = true uniqueOpened = uniqueOpened + 1 end
-    totalOpens = totalOpens + 1
-    Flags.Collected = totalOpens
-    print("Server: opened chest " .. tostring(chest.Name) .. " (" .. uniqueOpened .. " unique)")
-    refreshCounter()
-    if console then console:Write("Opened chest " .. tostring(chest.Name)) end
-  end)
+    print("Server: opened chest " .. tostring(chest.Name))
   end
+  local demoRem = getRemote()
+  if demoRem then
+    demoRem.OnServerEvent:Connect(function(player, chest)
+      if typeof(chest) == "Instance" then serverOpen(player, chest) end
+    end)
+  end
+  -- prompt trigger also opens (this is the path the new collector uses).
+  -- handles prompts added directly AND prompts nested inside added models.
+  local function hookPrompt(p)
+    if not p or p.ClassName ~= "ProximityPrompt" then return end
+    if p._serverHooked then return end
+    p._serverHooked = true
+    p.Triggered:Connect(function(player)
+      local m = modelOf(p)
+      if m then serverOpen(player, m) end
+    end)
+  end
+  task.spawn(function()
+    task.wait(0.1)
+    for _, d in ipairs(workspace:GetDescendants()) do
+      if d.ClassName == "ProximityPrompt" then hookPrompt(d) end
+    end
+    workspace.DescendantAdded:Connect(function(d)
+      if d.ClassName == "ProximityPrompt" then
+        hookPrompt(d)
+      else
+        -- a whole chest model was added: hook any prompts inside it
+        local ok, desc = pcall(function() return d:GetDescendants() end)
+        if ok and desc then
+          for _, x in ipairs(desc) do
+            if x.ClassName == "ProximityPrompt" then hookPrompt(x) end
+          end
+        end
+        if d.ClassName == "Model" and tonumber(d.Name) then
+          local ok2, pr = pcall(function() return d:FindFirstChild("ProximityPrompt", true) end)
+          -- FindFirstChild with recursive may return the prompt; hook via descendants above
+          if ok2 and pr then hookPrompt(pr) end
+        end
+      end
+    end)
+  end)
 end
 
 local Window = VantixUI:CreateWindow({
@@ -502,7 +661,7 @@ local Window = VantixUI:CreateWindow({
   AccentColor = Color3.fromRGB(80, 210, 120),
   Size        = {560, 460},
 })
-Window:CreateTag("v1.1", Color3.fromRGB(60, 120, 210), nil, "package")
+Window:CreateTag("v1.2", Color3.fromRGB(60, 120, 210), nil, "package")
 Window:Notify({ Title = "Chest Collector", Text = "Loaded. Flip Auto Collect to start.", Duration = 3 })
 
 local FarmTab = Window:AddTab("Collector", "package")
@@ -512,14 +671,25 @@ countLabel = FarmTab:AddLabel("Opened: 0 / 54 (0 total)", "trophy")
 
 local autoToggle = FarmTab:AddToggle({
   Title    = "Auto Collect",
-  Subtitle = "Loops chests 24/7, picks up respawns",
+  Subtitle = "Loops 1->54 in order, picks up respawns",
   Icon     = "repeat",
   Default  = false,
   Callback = function(state)
     Flags.Auto = state
-    console:Write("Auto Collect " .. (state and "enabled" or "disabled"))
+    say("Auto Collect " .. (state and "enabled" or "disabled"))
     Window:Notify({ Title = "Auto Collect", Text = state and "Enabled" or "Disabled", Duration = 2 })
-    status:Set("Status: auto " .. (state and "on" or "off"))
+    setStatus("Status: auto " .. (state and "on (1->54)" or "off"))
+  end,
+})
+
+local orderToggle = FarmTab:AddToggle({
+  Title    = "In Order 1-2-3",
+  Subtitle = "Off = nearest-first (old way, can repeat)",
+  Icon     = "list-ordered",
+  Default  = true,
+  Callback = function(state)
+    Flags.InOrder = state
+    say("Order: " .. (state and "1->54 in order" or "nearest-first"))
   end,
 })
 
@@ -527,8 +697,8 @@ local radiusSlider = FarmTab:AddSlider({
   Title   = "Collect Radius",
   Icon    = "radar",
   Min     = 25,
-  Max     = 500,
-  Default = 200,
+  Max     = 2000,
+  Default = 1000,
   Callback = function(value) Flags.Radius = value end,
 })
 
@@ -566,7 +736,7 @@ FarmTab:AddTextBox({
   Callback    = function(text)
     if text ~= "" then Flags.RemoteName = text openRemote = nil warnedNoRemote = false end
     local r = getRemote()
-    console:Write(r and ("Remote: " .. tostring(r.Name)) or "Remote: not found, will retry")
+    say(r and ("Remote: " .. tostring(r.Name)) or "Remote: not found, prompt-only mode")
   end,
 })
 
@@ -585,28 +755,26 @@ local methodDropdown = FarmTab:AddDropdown({
 })
 
 FarmTab:AddButton({
-  Title    = "Collect Nearest",
-  Subtitle = "One pass, closest chest only",
-  Icon     = "mouse-pointer",
-  Text     = "Collect",
+  Title    = "Collect 1-54 In Order",
+  Subtitle = "One sweep: 1 then 2 then 3...",
+  Icon     = "list-ordered",
+  Text     = "Start 1-54",
   Callback = function()
-    local n = collectPass(true)
-    console:Write("Nearest pass: " .. n .. " collected")
+    say("Sweep started: " .. Flags.From .. " -> " .. Flags.To .. " in order")
+    local n = collectOrdered()
+    say("Sweep: visited " .. n .. " chests in order")
+    Window:Notify({ Title = "Done", Text = "Sweep finished", Duration = 3 })
   end,
 })
 
 FarmTab:AddButton({
-  Title    = "Collect All in Radius",
-  Subtitle = "One sweep, nearest first",
-  Icon     = "package",
-  Text     = "Sweep",
+  Title    = "Collect Nearest",
+  Subtitle = "One chest, closest first (legacy)",
+  Icon     = "mouse-pointer",
+  Text     = "Collect",
   Callback = function()
-    local n = collectPass(false)
-    console:Write("Sweep: " .. n .. " collected")
-    if #(findChests()) == 0 and totalOpens > 0 then
-      Window:Notify({ Title = "Done", Text = "All chests collected", Duration = 3 })
-      status:Set("Status: all chests collected")
-    end
+    local n = collectNearestOnce()
+    say("Nearest pass: " .. n .. " collected")
   end,
 })
 
@@ -620,13 +788,15 @@ FarmTab:AddButton({
     openRemote = nil
     warnedNoRemote = false
     local r = getRemote()
-    local list = findChests()
-    console:Write("Cache rebuilt: " .. #list .. " chest(s) in range"
-      .. (r and (" | remote: " .. tostring(r.Name)) or " | remote: NOT FOUND"))
-    if #list == 0 then
-      console:Write("Hint: check From/To range and that chest models are named 1..54")
+    ensureCache()
+    local n = 0
+    for _ in pairs(cache) do n = n + 1 end
+    say("Cache rebuilt: " .. n .. " chest(s) tracked"
+      .. (r and (" | remote: " .. tostring(r.Name)) or " | remote: prompt-only"))
+    if n == 0 then
+      say("Hint: check From/To range and that chest models are named 1..54")
     end
-    status:Set("Status: " .. #list .. " chest(s) in range")
+    setStatus("Status: " .. n .. " chest(s) tracked")
   end,
 })
 
@@ -639,7 +809,7 @@ FarmTab:AddToggleKey({
 })
 
 console = FarmTab:AddConsole({ Title = "Activity Log", Height = 110 })
-console:Write("Chest Collector 1-54 loaded")
+console:Write("Chest Collector 1-54 loaded (1->54 order)")
 do
   local r = getRemote()
   if r then console:Write("Remote: " .. tostring(r.Name)) end
@@ -654,52 +824,50 @@ SettingsTab:AddButton({
 })
 
 task.spawn(function()
-  -- real executor: background loop. skipped in the mock (each Run executes once;
-  -- the demo sweep below shows the same behaviour, buttons drive the rest).
   if FALLBACK then return end
   while true do
     if Flags.Auto then
-      collectPass(false)
-      if #(findChests()) == 0 and totalOpens > 0 then
-        status:Set("Status: all chests collected")
+      if Flags.InOrder then
+        collectOrdered()
+      else
+        collectNearestOnce()
       end
     end
-    task.wait(Flags.Delay)
+    task.wait(math.max(0.5, Flags.Delay))
   end
 end)
 
 if FALLBACK then
   if not hasAnyPrompt() then buildDemoWorld() end
-  print("Demo: running one automatic sweep so you can watch it work.")
-  collectPass(false)
-  -- fresh scan so availability memory settles, then simulate a respawn
-  findChests()
+  print("Demo: running one automatic 1->54 sweep so you can watch it work.")
+  Flags.To = 8
+  collectOrdered()
+  -- simulate a respawn: chest 3 comes back
   local r3 = findModelByNum(3)
   if r3 then
     local opened = r3:FindFirstChild("Opened")
     if opened then opened.Value = false end
     disablePrompts(r3, true)
-    print("Demo: chest 3 respawned - watching for it.")
-    collectPass(false)
+    print("Demo: chest 3 respawned - collecting it again.")
+    collectOneNum(3)
   end
-  -- streaming demo 1: chest 7's area unloads mid-run
+  -- streaming demo: chest 7's area unloads mid-run
   local m7 = findModelByNum(7)
   if m7 then
     m7.Parent = nil
-    print("Demo: chest 7 streamed out (area not rendered). Sweeping anyway.")
-    collectPass(false)
+    print("Demo: chest 7 streamed out (area not rendered). Going back for it.")
+    collectOneNum(7)
     m7.Parent = workspace
     print("Demo: chest 7 streamed back in on approach.")
-    collectPass(false)
+    collectOneNum(7)
   end
-  -- streaming demo 2: a brand-new chest streams in late
   if demoHidden9 then
     demoHidden9.Parent = workspace
     print("Demo: chest 9 just streamed in.")
-    collectPass(false)
+    collectOneNum(9)
   end
   print("Demo done: " .. uniqueOpened .. " unique chests, " .. totalOpens .. " total opens.")
 end
 
 -- handle for driving / testing the collector
-ChestCollector = { Flags = Flags, findChests = findChests, collectPass = collectPass, getHRP = getHRP }
+ChestCollector = { Flags = Flags, collectOneNum = collectOneNum, collectOrdered = collectOrdered, findChestByNum = findChestByNum, getHRP = getHRP }
