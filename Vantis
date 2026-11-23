@@ -963,6 +963,28 @@ local function findDropButton()
   return nil
 end
 
+-- true when the button (and its parents) are actually shown
+local function btnUsable(b)
+  local ok = true
+  pcall(function()
+    if b.Visible == false then ok = false end
+  end)
+  pcall(function()
+    if b.Active == false then ok = false end
+  end)
+  pcall(function()
+    local cur = b.Parent
+    while cur and cur.ClassName ~= "PlayerGui" and cur.ClassName ~= "DataModel" do
+      if cur.Visible == false then
+        ok = false
+        break
+      end
+      cur = cur.Parent
+    end
+  end)
+  return ok
+end
+
 -- confirmation popup after Drop: the game spells it "Conform"
 local function findConfirmButton(exceptBtn)
   local pg = getPlayerGui()
@@ -970,13 +992,13 @@ local function findConfirmButton(exceptBtn)
   for _, nm in ipairs({"Conform", "Confirm", "Yes", "OK"}) do
     local b = nil
     pcall(function() b = pg:FindFirstChild(nm, true) end)
-    if b and b ~= exceptBtn then return b end
+    if b and b ~= exceptBtn and btnUsable(b) then return b end
   end
   local all = nil
   pcall(function() all = pg:GetDescendants() end)
   if all then
     for _, d in ipairs(all) do
-      if (d.ClassName == "TextButton" or d.ClassName == "ImageButton") and d ~= exceptBtn then
+      if (d.ClassName == "TextButton" or d.ClassName == "ImageButton") and d ~= exceptBtn and btnUsable(d) then
         local hit = false
         pcall(function()
           local n = string.lower(d.Name or "")
@@ -1092,20 +1114,33 @@ local function dropOneOf(itemName, myToken)
     if progressed then
       noProgress = 0
     else
-      -- select/equip alone did nothing: Drop button, then remote, then Backspace
-      local dropBtn = findDropButton()
-      if dropBtn then
-        clickGui(dropBtn)
-        task.wait(0.15)
-        -- confirmation popup after Drop ("Conform" in this game)
-        local confirmBtn = findConfirmButton(dropBtn)
-        if confirmBtn then
-          clickGui(confirmBtn)
-          say("Conform pressed for " .. itemName)
+      -- select/equip alone did nothing: confirmation first, then Drop, then remote
+      -- 1. leftover confirmation from the last attempt? press it, don't re-drop
+      local preConfirm = findConfirmButton(nil)
+      if preConfirm then
+        clickGui(preConfirm)
+        say("Conform pressed for " .. itemName)
+        task.wait(0.3)
+      else
+        -- 2. Drop button, then POLL for the confirmation (it can pop in late)
+        local dropBtn = findDropButton()
+        if dropBtn then
+          clickGui(dropBtn)
+          local confirmBtn = nil
+          for i = 1, 25 do
+            if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+            confirmBtn = findConfirmButton(dropBtn)
+            if confirmBtn then break end
+            task.wait(0.1)
+          end
+          if confirmBtn then
+            clickGui(confirmBtn)
+            say("Conform pressed for " .. itemName)
+          end
+          task.wait(0.2)
         end
-        task.wait(0.2)
-        if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
       end
+      if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
       local t3 = findHeldTool(itemName)
       local s3, c3 = nil, nil
       if not t3 then s3, c3 = findItemSlot(itemName) end
@@ -1741,24 +1776,19 @@ if FALLBACK then
     end
     demoItem("Legendary Arrow", 2)
     demoItem("Stand Arrow", 1)
-    local drop = Instance.new("TextButton")
-    drop.Name = "Drop"
-    drop.Text = "Drop"
-    drop.Parent = frame
-    local conform = Instance.new("TextButton")
-    conform.Name = "Conform"
-    conform.Text = "Conform"
-    conform.Parent = frame
-    conform.Activate = function(self)
-      print("Demo: Conform pressed")
-    end
     local demoPack = Instance.new("Folder")
     demoPack.Name = "Backpack"
     LP.Backpack = demoPack
     local demoTool = Instance.new("Tool")
     demoTool.Name = "Shiny Arrow"
     demoTool.Parent = demoPack
-    drop.Activate = function(self)
+    local conform = Instance.new("TextButton")
+    conform.Name = "Conform"
+    conform.Text = "Conform"
+    conform.Visible = false
+    conform.Parent = frame
+    conform.Activate = function(self)
+      print("Demo: Conform pressed")
       pcall(function()
         for _, cont in ipairs({demoPack, LP.Character}) do
           if cont then
@@ -1766,12 +1796,21 @@ if FALLBACK then
               if c.Name == "Shiny Arrow" or c.Name == "Legendary Arrow"
                 or c.Name == "Stand Arrow" or c.Name == "Locacaca Fruit" then
                 c.Parent = nil
+                conform.Visible = false
                 return
               end
             end
           end
         end
       end)
+    end
+    local drop = Instance.new("TextButton")
+    drop.Name = "Drop"
+    drop.Text = "Drop"
+    drop.Parent = frame
+    drop.Activate = function(self)
+      -- popup appears; the actual removal happens on Conform
+      conform.Visible = true
     end
   end)
   print("Demo: dropping arrows/fruit like Drop All does (frozen at 298, 17, 207).")
