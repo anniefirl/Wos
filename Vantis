@@ -1,0 +1,419 @@
+-- Chest Collector (VantixUI style)
+-- Collects chests like the ones in your place file: Chest / BombChest / RChest,
+-- each with a ProximityPrompt + Opened flag, opened through the OpenChest remote.
+-- Runs in a real executor (loads the real VantixUI) and in this editor
+-- (falls back to a built-in shim that mirrors the same calls).
+-- Written in a strict Luau subset (no +=, no continue) so it also runs on stock Lua 5.3.
+
+local OPEN_REMOTE_NAME = "OpenChest"
+
+local VantixUI = nil
+do
+  local ok, lib = pcall(function()
+    local src = game:HttpGet("https://raw.githubusercontent.com/Snipez-Dev/Vantix/refs/heads/main/VantixUI6")
+    return loadstring(src)()
+  end)
+  if ok and type(lib) == "table" and type(lib.CreateWindow) == "function" then
+    VantixUI = lib
+  end
+end
+local FALLBACK = (VantixUI == nil)
+
+if FALLBACK then
+  -- Minimal Vantix-compatible shim: same calls, logged to the Output panel.
+  local function newSignal()
+    local sig = { _cons = {} }
+    function sig:Connect(fn)
+      table.insert(sig._cons, fn)
+      return { Connected = true, Disconnect = function() end }
+    end
+    function sig:Fire(...)
+      for _, fn in ipairs(sig._cons) do pcall(fn, ...) end
+    end
+    return sig
+  end
+  local function makeElement(def)
+    local el = { _value = def.Default, Changed = newSignal() }
+    function el:Get() return el._value end
+    function el:Set(v)
+      el._value = v
+      el.Changed:Fire(v)
+      if def.Callback then def.Callback(v) end
+    end
+    function el:SetOptions(opts) el._options = opts end
+    function el:Press() if def.Callback then def.Callback() end end
+    function el:Write(msg) print("[log] " .. tostring(msg)) end
+    function el:Clear() print("[log] cleared") end
+    function el:Lock(_) el._locked = true end
+    function el:Unlock() el._locked = false end
+    function el:IsLocked() return el._locked == true end
+    return el
+  end
+  local function makeTab(name)
+    print("[ui] tab '" .. tostring(name) .. "' ready")
+    local tab = {}
+    function tab:AddToggle(def) return makeElement(def) end
+    function tab:AddSlider(def) return makeElement(def) end
+    function tab:AddButton(def) return makeElement(def) end
+    function tab:AddDropdown(def) return makeElement(def) end
+    function tab:AddLabel(text, _) return makeElement({ Default = text }) end
+    function tab:AddConsole(_) return makeElement({}) end
+    function tab:AddSeparator() end
+    function tab:AddToggleKey(_) return makeElement({}) end
+    function tab:AddKeybind(_) return makeElement({}) end
+    function tab:AddTextBox(def) return makeElement(def) end
+    return tab
+  end
+  local ui = {}
+  function ui:CreateWindow(def)
+    print("[ui] window '" .. tostring(def.Title) .. "' ready (fallback mode, no real rendering)")
+    local win = {}
+    function win:AddTab(name, _) return makeTab(name) end
+    function win:CreateTag(...) end
+    function win:Notify(n) print("Notify [" .. tostring(n.Title) .. "] " .. tostring(n.Text)) end
+    function win:SetToggleKey(_) end
+    function win:GetToggleKey() return { Name = "RightShift" } end
+    function win:Minimize() end
+    function win:Restore() end
+    function win:Toggle() end
+    function win:IsMinimized() return false end
+    function win:Destroy() print("[ui] window destroyed") end
+    win.Gui = nil
+    return win
+  end
+  VantixUI = ui
+end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+
+local Flags = { Auto = false, Radius = 150, Delay = 0.5, Method = "Teleport", Collected = 0 }
+
+-- created by the UI below, callbacks only use them later
+local status, countLabel, console
+
+local function getHRP()
+  local char = LP.Character
+  if char then
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp then return hrp end
+  end
+  char = Instance.new("Model")
+  char.Name = LP.Name or "Player1"
+  local hrp = Instance.new("Part")
+  hrp.Name = "HumanoidRootPart"
+  hrp.Position = Vector3.new(0, 5, 0)
+  hrp.Anchored = true
+  hrp.Parent = char
+  char.Parent = workspace
+  LP.Character = char
+  return hrp
+end
+
+local function hasAnyPrompt()
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d.ClassName == "ProximityPrompt" then return true end
+  end
+  return false
+end
+
+local function buildDemoWorld()
+  -- chest setup mirrored from the example place file
+  local spots = {
+    { name = "Chest", pos = Vector3.new(20, 3, 0) },
+    { name = "Chest", pos = Vector3.new(-35, 3, 10) },
+    { name = "BombChest", pos = Vector3.new(60, 3, -25) },
+    { name = "RChest", pos = Vector3.new(-70, 3, -40) },
+  }
+  for _, s in ipairs(spots) do
+    local m = Instance.new("Model")
+    m.Name = s.name
+    local part = Instance.new("Part")
+    part.Name = "ChestPart"
+    part.Position = s.pos
+    part.Anchored = true
+    part.Parent = m
+    local opened = Instance.new("BoolValue")
+    opened.Name = "Opened"
+    opened.Value = false
+    opened.Parent = m
+    local prompt = Instance.new("ProximityPrompt")
+    prompt.HoldDuration = 0.5
+    prompt.MaxActivationDistance = 10
+    prompt.Parent = part
+    m.Parent = workspace
+  end
+  print("Demo world: 4 chests placed (Chest x2, BombChest, RChest)")
+end
+
+local openRemote = ReplicatedStorage:FindFirstChild(OPEN_REMOTE_NAME)
+if not openRemote then
+  openRemote = Instance.new("RemoteEvent")
+  openRemote.Name = OPEN_REMOTE_NAME
+  openRemote.Parent = ReplicatedStorage
+end
+
+local function disablePrompts(chest)
+  for _, d in ipairs(chest:GetDescendants()) do
+    if d.ClassName == "ProximityPrompt" then d.Enabled = false end
+  end
+end
+
+if FALLBACK then
+  -- demo "game server" so the full open loop runs inside the mock.
+  -- in the real game the actual server owns this logic.
+  openRemote.OnServerEvent:Connect(function(player, chest)
+    if typeof(chest) ~= "Instance" or not chest.FindFirstChild then
+      print("Server: rejected bad request from " .. tostring(player.Name))
+      return
+    end
+    local opened = chest:FindFirstChild("Opened")
+    if not opened or opened.Value then
+      print("Server: " .. tostring(chest.Name) .. " already opened, ignoring")
+      return
+    end
+    -- server-side range check (a real game checks player.Character here)
+    local hrp = getHRP()
+    local part = chest:FindFirstChild("ChestPart", true)
+    if hrp and part then
+      local d = hrp.Position - part.Position
+      local dist = math.sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z)
+      if dist > 60 then
+        print("Server: " .. tostring(player.Name) .. " too far from " .. tostring(chest.Name))
+        return
+      end
+    end
+    opened.Value = true
+    disablePrompts(chest)
+    Flags.Collected = Flags.Collected + 1
+    print("Server: opened " .. tostring(chest.Name) .. " (" .. Flags.Collected .. " total)")
+    if countLabel then countLabel:Set("Chests Opened: " .. Flags.Collected) end
+    if console then console:Write("Opened " .. tostring(chest.Name)) end
+  end)
+end
+
+local function chestOf(prompt)
+  local node = prompt.Parent
+  for _ = 1, 3 do
+    if node == nil then return nil end
+    if node.FindFirstChild and node:FindFirstChild("Opened") then return node end
+    node = node.Parent
+  end
+  return nil
+end
+
+local function dist3(a, b)
+  local dx = a.X - b.X
+  local dy = a.Y - b.Y
+  local dz = a.Z - b.Z
+  return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function findChests()
+  local out = {}
+  local hrp = getHRP()
+  if not hrp then return out end
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d.ClassName == "ProximityPrompt" and d.Enabled ~= false then
+      local chest = chestOf(d)
+      local opened = chest and chest:FindFirstChild("Opened") or nil
+      if chest and opened and not opened.Value then
+        local part = d.Parent
+        if part and part.Position and dist3(hrp.Position, part.Position) <= Flags.Radius then
+          out[#out + 1] = { prompt = d, chest = chest, part = part,
+            dist = dist3(hrp.Position, part.Position) }
+        end
+      end
+    end
+  end
+  table.sort(out, function(a, b) return a.dist < b.dist end)
+  return out
+end
+
+local function holdPrompt(prompt)
+  task.wait(prompt.HoldDuration or 0.5)
+  if typeof(fireproximityprompt) == "function" then
+    fireproximityprompt(prompt)
+  elseif prompt.Triggered then
+    prompt.Triggered:Fire(LP)
+  end
+end
+
+local function collectOne(c)
+  local hrp = getHRP()
+  if not hrp then return false end
+  local p = c.part.Position
+  if Flags.Method == "Tween" then
+    local from = hrp.Position
+    for i = 1, 10 do
+      local t = i / 10
+      hrp.CFrame = CFrame.new(
+        from.X + (p.X - from.X) * t,
+        from.Y + (p.Y - from.Y) * t + 3,
+        from.Z + (p.Z - from.Z) * t)
+      task.wait(0.05)
+    end
+  else
+    hrp.CFrame = CFrame.new(p.X, p.Y + 3, p.Z)
+  end
+  task.wait(0.2)
+  holdPrompt(c.prompt)
+  openRemote:FireServer(c.chest)
+  return true
+end
+
+local function collectPass(onlyNearest)
+  local list = findChests()
+  if status then status:Set("Status: " .. #list .. " chest(s) in range") end
+  local n = 0
+  for i, c in ipairs(list) do
+    if onlyNearest and i > 1 then break end
+    collectOne(c)
+    n = n + 1
+    task.wait(Flags.Delay)
+  end
+  return n
+end
+
+local Window = VantixUI:CreateWindow({
+  Title       = "Chest Collector",
+  Theme       = "Vantix",
+  AccentColor = Color3.fromRGB(80, 210, 120),
+  Size        = {560, 420},
+})
+Window:CreateTag("v1.0", Color3.fromRGB(60, 120, 210), nil, "package")
+Window:Notify({ Title = "Chest Collector", Text = "Loaded. Flip Auto Collect to start.", Duration = 3 })
+
+local FarmTab = Window:AddTab("Collector", "package")
+
+status = FarmTab:AddLabel("Status: idle", "activity")
+countLabel = FarmTab:AddLabel("Chests Opened: 0", "trophy")
+
+local autoToggle = FarmTab:AddToggle({
+  Title    = "Auto Collect",
+  Subtitle = "Loops the nearest chests",
+  Icon     = "repeat",
+  Default  = false,
+  Callback = function(state)
+    Flags.Auto = state
+    console:Write("Auto Collect " .. (state and "enabled" or "disabled"))
+    Window:Notify({ Title = "Auto Collect", Text = state and "Enabled" or "Disabled", Duration = 2 })
+    status:Set("Status: auto " .. (state and "on" or "off"))
+  end,
+})
+
+local radiusSlider = FarmTab:AddSlider({
+  Title   = "Collect Radius",
+  Icon    = "radar",
+  Min     = 25,
+  Max     = 300,
+  Default = 150,
+  Callback = function(value) Flags.Radius = value end,
+})
+
+local delaySlider = FarmTab:AddSlider({
+  Title    = "Delay x0.1s",
+  Subtitle = "Wait between chests, tenths of a second",
+  Icon     = "timer",
+  Min      = 2,
+  Max      = 20,
+  Default  = 5,
+  Callback = function(value) Flags.Delay = value / 10 end,
+})
+
+local methodDropdown = FarmTab:AddDropdown({
+  Title   = "Move Method",
+  Icon    = "move",
+  Options = {"Teleport", "Tween"},
+  Default = 1,
+  Callback = function(selected)
+    if selected == 2 or selected == "Tween" then
+      Flags.Method = "Tween"
+    else
+      Flags.Method = "Teleport"
+    end
+  end,
+})
+
+FarmTab:AddButton({
+  Title    = "Collect Nearest",
+  Subtitle = "One pass, closest chest only",
+  Icon     = "mouse-pointer",
+  Text     = "Collect",
+  Callback = function()
+    local n = collectPass(true)
+    console:Write("Nearest pass: " .. n .. " collected")
+  end,
+})
+
+FarmTab:AddButton({
+  Title    = "Collect All in Radius",
+  Subtitle = "One sweep, nearest first",
+  Icon     = "package",
+  Text     = "Sweep",
+  Callback = function()
+    local n = collectPass(false)
+    console:Write("Sweep: " .. n .. " collected")
+    if #(findChests()) == 0 and Flags.Collected > 0 then
+      Window:Notify({ Title = "Done", Text = "All chests collected", Duration = 3 })
+      status:Set("Status: all chests collected")
+    end
+  end,
+})
+
+FarmTab:AddButton({
+  Title    = "Rebuild Chest Cache",
+  Subtitle = "Rescans the map for chests",
+  Icon     = "refresh-cw",
+  Text     = "Rebuild",
+  Callback = function()
+    local list = findChests()
+    console:Write("Cache rebuilt: " .. #list .. " chest(s) in range")
+    status:Set("Status: " .. #list .. " chest(s) in range")
+  end,
+})
+
+FarmTab:AddSeparator()
+
+FarmTab:AddToggleKey({
+  Title    = "UI Toggle Key",
+  Subtitle = "Key that hides / shows the window",
+  Icon     = "keyboard",
+})
+
+console = FarmTab:AddConsole({ Title = "Activity Log", Height = 110 })
+console:Write("Chest Collector loaded")
+
+local SettingsTab = Window:AddTab("Settings", "settings")
+SettingsTab:AddButton({
+  Title    = "Unload",
+  Icon     = "log-out",
+  Text     = "Unload",
+  Callback = function() Window:Destroy() end,
+})
+
+task.spawn(function()
+  -- real executor: background loop. skipped in the mock (each Run executes once;
+  -- the demo sweep below shows the same behaviour, buttons drive the rest).
+  if FALLBACK then return end
+  while true do
+    if Flags.Auto then
+      collectPass(false)
+      if #(findChests()) == 0 and Flags.Collected > 0 then
+        status:Set("Status: all chests collected")
+      end
+    end
+    task.wait(Flags.Delay)
+  end
+end)
+
+if FALLBACK then
+  if not hasAnyPrompt() then buildDemoWorld() end
+  print("Demo: running one automatic sweep so you can watch it work.")
+  collectPass(false)
+  print("Demo sweep done: " .. Flags.Collected .. " opened. Flip Auto Collect for the loop.")
+end
+
+-- handle for driving / testing the collector
+ChestCollector = { Flags = Flags, findChests = findChests, collectPass = collectPass, getHRP = getHRP }
