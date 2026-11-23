@@ -29,9 +29,7 @@ local warnedNoRemote = false
 local sweepToken = 0
 local manualRunning = false
 local dropRunning = false
-local internalRunning = false
 local dropToggle -- assigned in the Drops tab; the real Auto Drop switch
-local internalToggle -- assigned in the Drops tab; the headless Internal Drop switch
 local FALLBACK -- assigned when VantixUI loads below; forward so getHRP sees it
 
 -- any sweep carrying an old token must stop at its next checkpoint.
@@ -45,13 +43,19 @@ local status = nil
 local countLabel = nil
 local console = nil
 local openRemote = nil
+local openRemoteCheckedAt = 0
 
 local function say(msg)
   print(msg)
   if console then pcall(function() console:Write(msg) end) end
 end
 
+local lastStatusMsg = nil
 local function setStatus(msg)
+  -- dedup: the drop loop sets "(1 left)..." every attempt; re-pushing the
+  -- identical text to the label + activity log 30x is pure UI spam/cost.
+  if msg == lastStatusMsg then return end
+  lastStatusMsg = msg
   print(msg)
   if status then
     pcall(function() status:Set(msg) end)
@@ -65,13 +69,23 @@ local function refreshCounter()
   print(msg)
 end
 
+local hrpCache = nil
+local hrpCacheAt = 0
+
 local function getHRP()
+  -- RootPart lookup runs on EVERY drop attempt + farm step; cache it for
+  -- 5s while it stays alive instead of re-walking Character each time.
+  local alive = false
+  pcall(function()
+    alive = hrpCache ~= nil and hrpCache.Parent ~= nil
+  end)
+  if alive and tick() - hrpCacheAt < 5 then return hrpCache end
   local char = nil
   pcall(function() if LP then char = LP.Character end end)
   if char then
     local hrp = nil
     pcall(function() hrp = char:FindFirstChild("HumanoidRootPart") end)
-    if hrp then return hrp end
+    if hrp then hrpCache = hrp hrpCacheAt = tick() return hrp end
   end
   if not FALLBACK then return nil end
   char = Instance.new("Model")
@@ -83,6 +97,7 @@ local function getHRP()
   hrp.Parent = char
   char.Parent = workspace
   LP.Character = char
+  hrpCache = hrp hrpCacheAt = tick()
   return hrp
 end
 
@@ -277,7 +292,12 @@ end
 
 local function getRemote()
   if openRemote and openRemote.Parent ~= nil then return openRemote end
+  -- negative cache: a missing remote rescans ReplicatedStorage every chest
+  -- try (54 scans per sweep in prompt-only mode). re-check every 30s.
+  local now = tick()
+  if openRemote == nil and now - openRemoteCheckedAt < 30 then return nil end
   openRemote = resolveRemote()
+  openRemoteCheckedAt = now
   if openRemote then say("Remote: " .. tostring(openRemote.Name)) end
   return openRemote
 end
@@ -366,9 +386,11 @@ local function visitRemembered(num, pos, myToken)
   if typeof(LP.RequestStreamAroundAsync) == "function" then
     pcall(function() LP:RequestStreamAroundAsync(pos) end)
   end
-  for _ = 1, 10 do
+  -- same ~5s coverage with half the full-workspace rescans (each miss
+  -- walks the whole workspace, so fewer, slower retries cost less CPU).
+  for _ = 1, 5 do
     if cancelled(myToken) then setStatus("Status: stopped") return nil end
-    task.wait(0.5)
+    task.wait(1)
     if cancelled(myToken) then setStatus("Status: stopped") return nil end
     local e = findChestByNum(num)
     if e and e.prompt and e.part and e.part.Position then
@@ -674,7 +696,9 @@ end
 
 -- cached inventory frame: recursive PlayerGui scans are the biggest lag
 -- source in the drop loop (called several times per attempt), so resolve
--- once and reuse for 5s while the frame stays alive.
+-- once and reuse for 15s while the frame stays alive (alive check guards
+-- stale frames; the snapshot-per-phase design means a reopened frame is
+-- picked up on the next phase at the latest).
 local invFrameCache = nil
 local invFrameCacheAt = 0
 local function getInvFrame()
@@ -683,7 +707,7 @@ local function getInvFrame()
   pcall(function()
     alive = f ~= nil and f.Parent ~= nil
   end)
-  if alive and tick() - invFrameCacheAt < 5 then return f end
+  if alive and tick() - invFrameCacheAt < 15 then return f end
   f = findInventoryGui()
   invFrameCache = f
   invFrameCacheAt = tick()
@@ -919,9 +943,13 @@ clickGui = function(btn)
       clicked = true
     end
   end)
+  -- connections: Activated + Click only (the signals a real click ends
+  -- with). the old code also fired every MouseButton1Down connection - a
+  -- lone Down without Up is meaningless input-wise, and double-ran any
+  -- handler listening on both Down and Click/Activated.
   pcall(function()
     if typeof(getconnections) == "function" then
-      for _, sigName in ipairs({"MouseButton1Click", "MouseButton1Down", "Activated"}) do
+      for _, sigName in ipairs({"MouseButton1Click", "Activated"}) do
         local sig = btn[sigName]
         if sig then
           for _, c in ipairs(getconnections(sig)) do
@@ -971,12 +999,16 @@ local function parseSlotCount(slot)
     end
   end
   pcall(function() scanText(slot.Text) end)
+  -- direct children only: counts live in a child label next to the slot.
+  -- the old code walked the whole subtree per slot (O(n*m)), which froze
+  -- big inventories - one shallow pass finds the same "x2" text.
   pcall(function()
-    for _, d in ipairs(slot:GetDescendants()) do
+    for _, d in ipairs(slot:GetChildren()) do
       if d.ClassName == "TextLabel" or d.ClassName == "TextButton" then
         local t = nil
         pcall(function() t = d.Text end)
         scanText(t)
+        if foundNumber then break end
       end
     end
   end)
@@ -996,12 +1028,14 @@ end
 -- then frames, then child labels, then one-direction fuzzy for decorated
 -- names ("Legendary Arrow ★"). clickables win so a list frame never
 -- shadows the slot button inside it.
-local function findItemSlotIn(container, itemName)
+local function findItemSlotIn(container, itemName, preAll)
   if not container then return nil end
   local want = normName(itemName)
   if want == "" then return nil end
-  local all = nil
-  pcall(function() all = container:GetDescendants() end)
+  local all = preAll
+  if not all then
+    pcall(function() all = container:GetDescendants() end)
+  end
   if not all then return nil end
   local function isSlotClass(d)
     local cls = d.ClassName
@@ -1015,9 +1049,11 @@ local function findItemSlotIn(container, itemName)
   end
   local function childLabelNorms(d)
     local out = {}
+    -- direct children only (was GetDescendants per candidate: O(n*m) and
+    -- the main freeze source). slot name labels sit one level down.
     pcall(function()
-      for _, c in ipairs(d:GetDescendants()) do
-        if c.ClassName == "TextLabel" then
+      for _, c in ipairs(d:GetChildren()) do
+        if c.ClassName == "TextLabel" or c.ClassName == "TextButton" then
           local t = nil
           pcall(function() t = c.Text end)
           if t then out[#out + 1] = normName(t) end
@@ -1084,18 +1120,31 @@ local function findItemSlotIn(container, itemName)
   return nil
 end
 
--- frame first ("fetch" scope), whole PlayerGui as fallback
+-- frame first ("fetch" scope). when the frame exists the search stays
+-- inside it: the old whole-PlayerGui fallback re-scanned thousands of
+-- unrelated nodes on every miss and froze the game. full PlayerGui is
+-- only searched when there is no frame at all.
 local function findItemSlot(itemName)
   local frame = getInvFrame()
   if frame then
-    local fs, fc = findItemSlotIn(frame, itemName)
-    if fs then return fs, fc end
+    return findItemSlotIn(frame, itemName)
   end
   local pg = getPlayerGui()
   if pg then
     return findItemSlotIn(pg, itemName)
   end
   return nil
+end
+
+-- one scan, all targets: snapshot the frame once per attempt and derive
+-- the slot + drop + confirm buttons from the same list instead of
+-- re-walking PlayerGui 6-8 times per attempt.
+local function snapshotFrame()
+  local frame = getInvFrame()
+  if not frame then return nil, nil end
+  local all = nil
+  pcall(function() all = frame:GetDescendants() end)
+  return frame, all
 end
 
 -- reads the frame's item entries ("fetch data"): logs every DropOrder item
@@ -1108,13 +1157,15 @@ local function fetchInventoryData()
     return data
   end
   local n = 0
+  -- one snapshot reused for the count AND all four items (was 5 scans).
+  local snap = nil
   pcall(function()
-    local all = frame:GetDescendants()
-    if all then n = #all end
+    if frame then snap = frame:GetDescendants() end
+    if snap then n = #snap end
   end)
   say("Fetch: '" .. tostring(frame.Name) .. "' has " .. n .. " descendants")
   for _, itemName in ipairs(DropOrder) do
-    local fs, fc = findItemSlotIn(frame, itemName)
+    local fs, fc = findItemSlotIn(frame, itemName, snap)
     local tool = findHeldTool(itemName)
     if fs then
       data[#data + 1] = { slot = fs, name = itemName, count = fc or 1 }
@@ -1182,15 +1233,17 @@ local function buttonMatches(d, words)
   return hit
 end
 
-local function findDropButtonIn(container, exceptBtn)
+local function findDropButtonIn(container, exceptBtn, preAll)
   if not container then return nil end
   for _, nm in ipairs({"Drop", "DropItem", "DropAll", "Discard", "Delete", "Trash", "Toss"}) do
     local b = nil
     pcall(function() b = container:FindFirstChild(nm, true) end)
     if b and b ~= exceptBtn and btnUsable(b) then return b end
   end
-  local all = nil
-  pcall(function() all = container:GetDescendants() end)
+  local all = preAll
+  if not all then
+    pcall(function() all = container:GetDescendants() end)
+  end
   if all then
     for _, d in ipairs(all) do
       if (d.ClassName == "TextButton" or d.ClassName == "ImageButton") and d ~= exceptBtn and btnUsable(d) then
@@ -1201,14 +1254,24 @@ local function findDropButtonIn(container, exceptBtn)
   return nil
 end
 
-local function findDropButton(exceptBtn)
+local function findDropButton(exceptBtn, preFrame, preAll)
+  -- frame-only when the frame exists (a stray global "Drop" from another
+  -- menu used to shadow the real one, and scanning all of PlayerGui as a
+  -- fallback on every attempt is what lagged the game out).
+  if preFrame then
+    local b = findDropButtonIn(preFrame, exceptBtn, preAll)
+    if b then return b end
+    return nil
+  end
   local frame = getInvFrame()
   local b = findDropButtonIn(frame, exceptBtn)
   if b then return b end
-  local pg = getPlayerGui()
-  if pg and pg ~= frame then
-    b = findDropButtonIn(pg, exceptBtn)
-    if b then return b end
+  if not frame then
+    local pg = getPlayerGui()
+    if pg then
+      b = findDropButtonIn(pg, exceptBtn)
+      if b then return b end
+    end
   end
   return nil
 end
@@ -1236,15 +1299,17 @@ btnUsable = function(b)
 end
 
 -- confirmation popup after Drop: the game spells it "Conform"
-local function findConfirmButtonIn(container, exceptBtn)
+local function findConfirmButtonIn(container, exceptBtn, preAll)
   if not container then return nil end
   for _, nm in ipairs({"Conform", "Confirm", "Yes", "OK"}) do
     local b = nil
     pcall(function() b = container:FindFirstChild(nm, true) end)
     if b and b ~= exceptBtn and btnUsable(b) then return b end
   end
-  local all = nil
-  pcall(function() all = container:GetDescendants() end)
+  local all = preAll
+  if not all then
+    pcall(function() all = container:GetDescendants() end)
+  end
   if all then
     for _, d in ipairs(all) do
       if (d.ClassName == "TextButton" or d.ClassName == "ImageButton") and d ~= exceptBtn and btnUsable(d) then
@@ -1255,20 +1320,28 @@ local function findConfirmButtonIn(container, exceptBtn)
   return nil
 end
 
-local function findConfirmButton(exceptBtn)
+local function findConfirmButton(exceptBtn, preFrame, preAll)
+  if preFrame then
+    local b = findConfirmButtonIn(preFrame, exceptBtn, preAll)
+    if b then return b end
+    return nil
+  end
   local frame = getInvFrame()
   local b = findConfirmButtonIn(frame, exceptBtn)
   if b then return b end
-  local pg = getPlayerGui()
-  if pg and pg ~= frame then
-    b = findConfirmButtonIn(pg, exceptBtn)
-    if b then return b end
+  if not frame then
+    local pg = getPlayerGui()
+    if pg then
+      b = findConfirmButtonIn(pg, exceptBtn)
+      if b then return b end
+    end
   end
   return nil
 end
 
 local dropRemote = nil
 local warnedNoDropRemote = false
+local dropRemoteCheckedAt = 0
 
 local function resolveDropRemote()
   local okRs, rs = pcall(function() return game:GetService("ReplicatedStorage") end)
@@ -1287,7 +1360,14 @@ end
 
 local function getDropRemote()
   if dropRemote and dropRemote.Parent ~= nil then return dropRemote end
+  -- negative cache: ReplicatedStorage walks are expensive, so a miss is
+  -- only re-scanned every 30s instead of on every drop attempt.
+  local now = tick()
+  if dropRemote == nil and now - dropRemoteCheckedAt < 30 then
+    return nil
+  end
   dropRemote = resolveDropRemote()
+  dropRemoteCheckedAt = now
   return dropRemote
 end
 
@@ -1295,22 +1375,39 @@ local function tryDropRemote(handle, itemName)
   local rem = getDropRemote()
   if not rem then
     if not warnedNoDropRemote then
-      say("No drop remote found - internal drops use Backspace only")
+      say("No drop remote found - GUI drops use clicks/Backspace only")
       warnedNoDropRemote = true
     end
     return
   end
+  -- one server call per fallback (was two: handle + name), calmer cadence.
   if rem.ClassName == "RemoteFunction" then
     if handle then pcall(function() rem:InvokeServer(handle) end)
     else pcall(function() rem:InvokeServer(itemName) end) end
   else
-    if handle then pcall(function() rem:FireServer(handle) end) end
-    pcall(function() rem:FireServer(itemName) end)
+    if handle then pcall(function() rem:FireServer(handle) end)
+    else pcall(function() rem:FireServer(itemName) end) end
   end
+end
+
+-- cheap exact-name check (engine-side FindFirstChild, no tree walk).
+-- the popup is USUALLY literally named Conform, so most polls resolve
+-- here and skip the expensive full-snapshot scan below.
+local function findConfirmFast(frame, exceptBtn)
+  if not frame then return nil end
+  for _, nm in ipairs({"Conform", "Confirm", "Yes", "OK"}) do
+    local b = nil
+    pcall(function() b = frame:FindFirstChild(nm, true) end)
+    if b and b ~= exceptBtn and btnUsable(b) then return b end
+  end
+  return nil
 end
 
 -- drops ONE item name until its count is 0. held tools (backpack + character)
 -- first, GUI slots second. returns ok, saw.
+-- perf: each phase snapshots the frame ONCE and derives slot/drop/confirm
+-- from that same list (the old code re-walked all of PlayerGui 6-8 times
+-- per attempt - that scan spam is what lagged/crashed the game).
 local function dropOneOf(itemName, myToken)
   local noProgress = 0
   local saw = false
@@ -1327,7 +1424,13 @@ local function dropOneOf(itemName, myToken)
       isTool = true
       saw = true
     else
-      local gs, gc = findItemSlot(itemName)
+      local frame0, snap0 = snapshotFrame()
+      local gs, gc = nil, nil
+      if frame0 then
+        gs, gc = findItemSlotIn(frame0, itemName, snap0)
+      else
+        gs, gc = findItemSlot(itemName)
+      end
       if not gs then
         return true, saw
       end
@@ -1353,10 +1456,18 @@ local function dropOneOf(itemName, myToken)
       task.wait(0.4)
     end
     if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-    -- recount tools first: gone from hands AND pack means actually dropped
+    -- recount: cheap held-tool check first; one GUI snapshot only if needed.
+    -- gone from hands AND pack means actually dropped.
     local t2 = findHeldTool(itemName)
     local s2, c2 = nil, nil
-    if not t2 then s2, c2 = findItemSlot(itemName) end
+    if not t2 then
+      local frame2, snap2 = snapshotFrame()
+      if frame2 then
+        s2, c2 = findItemSlotIn(frame2, itemName, snap2)
+      else
+        s2, c2 = findItemSlot(itemName)
+      end
+    end
     if not t2 and not s2 then
       return true, saw
     end
@@ -1367,15 +1478,17 @@ local function dropOneOf(itemName, myToken)
       -- old slow path that worked: leftover confirmation first, then Drop
       -- + a patient poll for the popup, then remote + Backspace every try.
       -- (same steps, tighter waits for speed)
-      -- 1. leftover confirmation from the last attempt? press it, don't re-drop
-      local preConfirm = findConfirmButton(nil)
+      -- 1. leftover confirmation from the last attempt? press it, don't re-drop.
+      -- one snapshot serves both the pre-confirm and the Drop lookup.
+      local frameB, snapB = snapshotFrame()
+      local preConfirm = findConfirmButton(nil, frameB, snapB)
       if preConfirm then
         clickGui(preConfirm)
         say("Conform pressed for " .. itemName)
         task.wait(0.6)
       else
         -- 2. Drop button, then POLL for the confirmation (it can pop in late)
-        local dropBtn = findDropButton()
+        local dropBtn = findDropButton(nil, frameB, snapB)
         if dropBtn then
           clickGui(dropBtn)
           task.wait(0.4)
@@ -1392,11 +1505,20 @@ local function dropOneOf(itemName, myToken)
             say("Conform pressed for " .. itemName)
           end
           local confirmBtn = nil
-          for i = 1, 25 do
+          -- fast exact-name polls every 0.25s (cheap, no tree walk); a full
+          -- snapshot scan only every 3rd poll for renamed/icon buttons.
+          -- same ~3s window, ~4 full scans instead of 25.
+          for i = 1, 12 do
             if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-            confirmBtn = findConfirmButton(dropBtn)
+            local frameC = getInvFrame()
+            confirmBtn = findConfirmFast(frameC, dropBtn)
+            if not confirmBtn and i % 3 == 1 then
+              local snapC = nil
+              if frameC then pcall(function() snapC = frameC:GetDescendants() end) end
+              confirmBtn = findConfirmButton(dropBtn, frameC, snapC)
+            end
             if confirmBtn then break end
-            task.wait(0.15)
+            task.wait(0.25)
           end
           if confirmBtn then
             clickGui(confirmBtn)
@@ -1412,7 +1534,11 @@ local function dropOneOf(itemName, myToken)
       if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
       local t3 = findHeldTool(itemName)
       local s3, c3 = nil, nil
-      if not t3 then s3, c3 = findItemSlot(itemName) end
+      if not t3 then
+        local frame3, snap3 = snapshotFrame()
+        if frame3 then s3, c3 = findItemSlotIn(frame3, itemName, snap3)
+        else s3, c3 = findItemSlot(itemName) end
+      end
       if not t3 and not s3 then return true, saw end
       local progressed2 = (not isTool) and s3 and (c3 or 1) < count
       if progressed2 then
@@ -1441,7 +1567,11 @@ local function dropOneOf(itemName, myToken)
         if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
         local t4 = findHeldTool(itemName)
         local s4, c4 = nil, nil
-        if not t4 then s4, c4 = findItemSlot(itemName) end
+        if not t4 then
+          local frame4, snap4 = snapshotFrame()
+          if frame4 then s4, c4 = findItemSlotIn(frame4, itemName, snap4)
+          else s4, c4 = findItemSlot(itemName) end
+        end
         if not t4 and not s4 then return true, saw end
         local progressed3 = (not isTool) and s4 and (c4 or 1) < count
         if progressed3 then noProgress = 0
@@ -1453,7 +1583,11 @@ local function dropOneOf(itemName, myToken)
           if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
           local t5 = findHeldTool(itemName)
           local s5, c5 = nil, nil
-          if not t5 then s5, c5 = findItemSlot(itemName) end
+          if not t5 then
+            local frame5, snap5 = snapshotFrame()
+            if frame5 then s5, c5 = findItemSlotIn(frame5, itemName, snap5)
+            else s5, c5 = findItemSlot(itemName) end
+          end
           if not t5 and not s5 then return true, saw end
           local progressed4 = (not isTool) and s5 and (c5 or 1) < count
           if progressed4 then noProgress = 0
@@ -1478,10 +1612,21 @@ end
 
 -- pure read: anything to drop right now? no teleport, no waits, so the
 -- idle loop below never yanks the player when there is nothing to do.
+-- perf: held tools first (two cheap GetChildren calls); one shared frame
+-- snapshot covers all four slot checks (was up to 8 full tree walks).
 local function dropHasWork()
   for _, itemName in ipairs(DropOrder) do
     if findHeldTool(itemName) then return true end
-    local slot = findItemSlot(itemName)
+  end
+  local frame, snap = snapshotFrame()
+  if not frame then
+    for _, itemName in ipairs(DropOrder) do
+      if findItemSlot(itemName) then return true end
+    end
+    return false
+  end
+  for _, itemName in ipairs(DropOrder) do
+    local slot = findItemSlotIn(frame, itemName, snap)
     if slot then return true end
   end
   return false
@@ -1513,148 +1658,19 @@ local function dropAllPriority(myToken)
   end
   if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
   -- final rebuild so the player sees the true (empty) list, not ghosts.
-  refreshInventory()
-  if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
+  -- skipped when nothing was ever seen: nothing changed, no rebuild needed.
+  if sawAny then
+    refreshInventory()
+    if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
+  end
   setStatus("Status: drop done - arrows/fruit at 0")
   say("Drop All done")
   return emptied, sawAny
 end
 
--- HEADLESS drop: no inventory GUI, no slot clicks, no Drop/Conform buttons.
--- Works purely inside the game: equip each held tool, fire the drop remote
--- when one is known, Backspace the equipped tool, verify it is gone from
--- Backpack AND Character. GUI-only stacks (no tool, no remote) are skipped
--- with a log line - those still need the GUI Auto Drop.
-local function dropOneInternal(itemName, myToken)
-  local saw = false
-  local droppedTool = false
-  local noProgress = 0
-  for attempt = 1, 30 do
-    if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-    local tool = findHeldTool(itemName)
-    if tool then
-      saw = true
-      setStatus("Status: drop [" .. itemName .. "] (internal)...")
-      -- equip it so Backspace / the remote has something to drop
-      pcall(function()
-        local char = LP.Character
-        local hum = nil
-        if char then
-          if char.FindFirstChildOfClass then hum = char:FindFirstChildOfClass("Humanoid")
-          else hum = char:FindFirstChild("Humanoid") end
-        end
-        if hum and hum.EquipTool then hum:EquipTool(tool) end
-      end)
-      task.wait(0.5)
-      if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-      local rem = getDropRemote()
-      if rem then
-        if rem.ClassName == "RemoteFunction" then
-          pcall(function() rem:InvokeServer(tool) end)
-        else
-          pcall(function() rem:FireServer(tool) end)
-          pcall(function() rem:FireServer(itemName) end)
-        end
-        task.wait(0.5)
-        if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-      end
-      -- Backspace drops the equipped tool in default backpacks, no GUI needed
-      pcall(function()
-        local vim = game:GetService("VirtualInputManager")
-        if vim and vim.SendKeyEvent then
-          vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
-          task.wait(0.2)
-          vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
-        end
-      end)
-      task.wait(0.5)
-      if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-      -- hands AND pack empty means actually dropped. a lingering GUI entry
-      -- after this is a ghost (stale client list), not a real item.
-      if not findHeldTool(itemName) then
-        droppedTool = true
-        return true, saw
-      else
-        noProgress = noProgress + 1
-      end
-    else
-      -- nothing held and we already dropped tools this run: anything left
-      -- on screen is a ghost. otherwise only a known drop remote could
-      -- remove a real server-side stack.
-      if droppedTool then return true, saw end
-      local rem = getDropRemote()
-      local slot = findItemSlot(itemName)
-      if rem and slot then
-        saw = true
-        setStatus("Status: drop [" .. itemName .. "] (internal remote)...")
-        if rem.ClassName == "RemoteFunction" then
-          pcall(function() rem:InvokeServer(itemName) end)
-        else
-          pcall(function() rem:FireServer(itemName) end)
-        end
-        task.wait(0.5)
-        if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-        local t2 = findHeldTool(itemName)
-        local s2 = findItemSlot(itemName)
-        if not t2 and not s2 then return true, saw end
-        noProgress = noProgress + 1
-      else
-        return true, saw
-      end
-    end
-    if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-    if noProgress >= 3 then
-      setStatus("Status: drop [" .. itemName .. "] stuck (internal), moving on")
-      say("Could not drop " .. itemName .. " internally - try the GUI Auto Drop")
-      pcall(function()
-        Window:Notify({ Title = "Drop stuck", Text = itemName .. " would not drop - see log", Duration = 4 })
-      end)
-      return false, saw
-    end
-  end
-  setStatus("Status: drop [" .. itemName .. "] gave up after 30 tries")
-  return false, saw
-end
-
--- anything droppable without opening the GUI? no teleport, no waits.
-local function dropHasInternalWork()
-  for _, itemName in ipairs(DropOrder) do
-    if findHeldTool(itemName) then return true end
-    if getDropRemote() and findItemSlot(itemName) then return true end
-  end
-  return false
-end
-
--- headless priority order: legendary -> shiny -> stand -> locacaca, each
--- until 0. freezes at the drop spot like the GUI path, but the inventory
--- is never opened and nothing is ever clicked.
-local function dropAllInternal(myToken)
-  if cancelled(myToken) then setStatus("Status: stopped") return 0, false end
-  freezeAtDropSpot()
-  if not getHRP() then
-    setStatus("Status: waiting for character...")
-    task.wait(1)
-    return 0, false
-  end
-  say("Internal drop: inventory stays closed, nothing is clicked")
-  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
-  local emptied = 0
-  local sawAny = false
-  for _, itemName in ipairs(DropOrder) do
-    if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-    setStatus("Status: drop [" .. itemName .. "] (internal)...")
-    local ok, saw = dropOneInternal(itemName, myToken)
-    if saw then sawAny = true
-    else say("Internal: " .. itemName .. " not held - skipped") end
-    if ok then emptied = emptied + 1 end
-    if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-    task.wait(0.1)
-  end
-  if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-  setStatus("Status: internal drop done")
-  say("Internal drop done")
-  return emptied, sawAny
-end
+-- Internal Drop was removed (it duplicated the GUI path and its extra
+-- scans/remotes doubled the load that lagged and crashed the game).
+-- GUI Auto Drop below is the only drop path now.
 
 -- Scan: dumps PlayerGui tree + backpack + drop/inventory remotes into the log
 -- so a mismatched GUI name can be identified. never throws.
@@ -1910,11 +1926,9 @@ local autoToggle = FarmTab:AddToggle({
     if state then
       -- farming takes over: halt any drop loop and show its switch as off
       dropRunning = false
-      internalRunning = false
       pcall(function() if dropToggle then dropToggle:Set(false) end end)
-      pcall(function() if internalToggle then internalToggle:Set(false) end end)
     else
-      manualRunning = false dropRunning = false internalRunning = false unfreezeNow()
+      manualRunning = false dropRunning = false unfreezeNow()
     end
     say("Auto Collect " .. (state and "enabled" or "disabled"))
     Window:Notify({ Title = "Auto Collect", Text = state and "Enabled" or "Disabled", Duration = 2 })
@@ -2074,9 +2088,7 @@ FarmTab:AddButton({
     sweepToken = sweepToken + 1
     manualRunning = false
     dropRunning = false
-    internalRunning = false
     pcall(function() if dropToggle then dropToggle:Set(false) end end)
-    pcall(function() if internalToggle then internalToggle:Set(false) end end)
     unfreezeNow()
     setStatus("Status: stopped")
     say("Stopped")
@@ -2149,8 +2161,6 @@ dropToggle = DropsTab:AddToggle({
   Callback = function(state)
     if state then
       if dropRunning then return end
-      internalRunning = false
-      pcall(function() if internalToggle then internalToggle:Set(false) end end)
       Flags.Auto = false
       pcall(function() autoToggle:Set(false) end)
       sweepToken = sweepToken + 1 -- pause farming so the player holds the drop spot
@@ -2177,7 +2187,9 @@ dropToggle = DropsTab:AddToggle({
                 say("Drop All sees no inventory - press Scan GUI and share the log")
               end
             end
-            task.wait(2.5)
+            -- idle: longer recheck (was 2.5s) so an empty inventory costs
+            -- almost no CPU/GPU while Auto Drop watches in the background.
+            task.wait(4)
           else
             blindSweeps = 0
             local emptied, sawAny = dropAllPriority(myToken)
@@ -2204,64 +2216,6 @@ dropToggle = DropsTab:AddToggle({
   end,
 })
 
-internalToggle = DropsTab:AddToggle({
-  Title    = "Internal Drop",
-  Subtitle = "Headless: equip + Backspace/remote, inventory never opens",
-  Icon     = "terminal",
-  Default  = false,
-  Callback = function(state)
-    if state then
-      if internalRunning then return end
-      dropRunning = false
-      pcall(function() if dropToggle then dropToggle:Set(false) end end)
-      Flags.Auto = false
-      pcall(function() autoToggle:Set(false) end)
-      sweepToken = sweepToken + 1 -- pause farming so the player holds the drop spot
-      local myToken = sweepToken
-      internalRunning = true
-      setStatus("Status: internal drop ON - looping until stopped")
-      say("Internal Drop ON: headless, inventory stays closed (frozen at 298, 17, 207)")
-      task.spawn(function()
-        local warned = false
-        local blindSweeps = 0
-        while not cancelled(myToken) do
-          if not dropHasInternalWork() then
-            if cancelled(myToken) then break end
-            blindSweeps = blindSweeps + 1
-            if blindSweeps == 1 then
-              setStatus("Status: internal idle - watching for held items")
-            end
-            if blindSweeps >= 3 and not warned then
-              warned = true
-              setStatus("Status: internal sees nothing held - run Scan GUI")
-              say("Internal Drop sees no held items - press Scan GUI and share the log")
-            end
-            task.wait(2.5)
-          else
-            blindSweeps = 0
-            local emptied, sawAny = dropAllInternal(myToken)
-            if cancelled(myToken) then break end
-            if not sawAny and not warned then
-              warned = true
-              setStatus("Status: internal sees nothing held - run Scan GUI")
-              say("Internal Drop sees no held items or remote targets - press Scan GUI and share the log")
-            end
-            task.wait(0.5)
-          end
-        end
-        unfreezeNow()
-        if myToken == sweepToken then internalRunning = false end
-      end)
-    else
-      if not internalRunning then return end
-      sweepToken = sweepToken + 1
-      internalRunning = false
-      unfreezeNow()
-      setStatus("Status: stopped")
-      say("Internal drop stopped")
-    end
-  end,
-})
 
 local AboutTab = Window:AddTab("About", "heart")
 AboutTab:AddLabel("Join us, its a small or maybe a server with 1-2 people it would be nice if you joined")
@@ -2422,32 +2376,6 @@ if FALLBACK then
       -- popup appears; the actual removal happens on Conform
       conform.Visible = true
     end
-    -- the game's internal drop remote (what Internal Drop fires instead of
-    -- touching the GUI): removes the named held tool, server-side.
-    local demoDropRemote = Instance.new("RemoteEvent")
-    demoDropRemote.Name = "DropItem"
-    demoDropRemote.Parent = ReplicatedStorage
-    demoDropRemote.OnServerEvent:Connect(function(player, what)
-      local name = nil
-      pcall(function()
-        if typeof(what) == "Instance" then name = what.Name
-        elseif type(what) == "string" then name = what end
-      end)
-      if not name then return end
-      print("Demo server: internal drop of " .. tostring(name))
-      pcall(function()
-        local pack = nil
-        if LP and LP.FindFirstChild then pack = LP:FindFirstChild("Backpack") end
-        if not pack and LP then pack = LP.Backpack end
-        for _, cont in ipairs({pack, LP.Character}) do
-          if cont then
-            for _, c in ipairs(cont:GetChildren()) do
-              if c.Name == name then c.Parent = nil return end
-            end
-          end
-        end
-      end)
-    end)
   end)
   print("Demo: dropping arrows/fruit like Drop All does (frozen at 298, 17, 207).")
   holdDropSpot()
