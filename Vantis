@@ -651,7 +651,7 @@ local function openInventory()
     return false
   end
   setGuiOpen(gui, true)
-  task.wait(0.3)
+  task.wait(0.1)
   if isGuiOpen(gui) then
     setStatus("Status: inventory open")
     say("Inventory opened")
@@ -661,7 +661,7 @@ local function openInventory()
   local toggle = findInventoryToggle()
   if toggle then
     clickGui(toggle)
-    task.wait(0.5)
+    task.wait(0.2)
     if isGuiOpen(gui) then
       setStatus("Status: inventory open")
       say("Inventory opened")
@@ -703,7 +703,7 @@ local function freezeAtDropSpot()
   pcall(function() hrp.Anchored = false end)
   zeroMotion(hrp)
   pcall(function() hrp.CFrame = dropSpotCFrame() end)
-  task.wait(0.15)
+  task.wait(0.05)
   pcall(function() hrp.CFrame = dropSpotCFrame() end)
   zeroMotion(hrp)
   pcall(function() hrp.Anchored = true end)
@@ -1075,10 +1075,10 @@ local function dropOneOf(itemName, myToken)
         end
         if hum and hum.EquipTool then hum:EquipTool(slot) end
       end)
-      task.wait(0.3)
+      task.wait(0.12)
     else
       clickGui(slot)
-      task.wait(0.4)
+      task.wait(0.15)
     end
     if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
     -- recount tools first: gone from hands AND pack means actually dropped
@@ -1096,14 +1096,14 @@ local function dropOneOf(itemName, myToken)
       local dropBtn = findDropButton()
       if dropBtn then
         clickGui(dropBtn)
-        task.wait(0.4)
+        task.wait(0.15)
         -- confirmation popup after Drop ("Conform" in this game)
         local confirmBtn = findConfirmButton(dropBtn)
         if confirmBtn then
           clickGui(confirmBtn)
           say("Conform pressed for " .. itemName)
         end
-        task.wait(0.5)
+        task.wait(0.2)
         if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
       end
       local t3 = findHeldTool(itemName)
@@ -1115,7 +1115,7 @@ local function dropOneOf(itemName, myToken)
         noProgress = 0
       else
         tryDropRemote(t3 or s3, itemName)
-        task.wait(0.5)
+        task.wait(0.2)
         if isTool then
           -- last resort: Backspace drops the equipped tool in default backpacks
           pcall(function()
@@ -1126,7 +1126,7 @@ local function dropOneOf(itemName, myToken)
               vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
             end
           end)
-          task.wait(0.3)
+          task.wait(0.15)
         end
         if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
         local t4 = findHeldTool(itemName)
@@ -1144,7 +1144,7 @@ local function dropOneOf(itemName, myToken)
       say("Could not drop " .. itemName .. " - leaving it and moving on")
       return false, saw
     end
-    task.wait(0.4)
+    task.wait(0.1)
   end
   setStatus("Status: drop [" .. itemName .. "] gave up after 30 tries")
   return false, saw
@@ -1167,7 +1167,7 @@ local function dropAllPriority(myToken)
     if saw then sawAny = true end
     if ok then emptied = emptied + 1 end
     if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-    task.wait(0.3)
+    task.wait(0.1)
   end
   if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
   setStatus("Status: drop done - arrows/fruit at 0")
@@ -1632,7 +1632,7 @@ DropsTab:AddButton({
           setStatus("Status: drop sees no inventory/items - run Scan GUI")
           say("Drop All sees no inventory or items - press Scan GUI and share the log")
         end
-        task.wait(1.5)
+        task.wait(0.5)
       end
       unfreezeNow()
       if myToken == sweepToken then dropRunning = false end
