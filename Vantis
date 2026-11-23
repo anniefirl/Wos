@@ -1,4 +1,4 @@
--- Chest Collector 1-54 (VantixUI style)
+-- Blossom Syth (VantixUI style)
 -- Goes in order: 1 then 2 then 3 ... up to To. No nearest-first, no repeats.
 -- Collects numbered chests ("1" .. "54").
 -- Primary method is the chest's own ProximityPrompt (fireproximityprompt):
@@ -30,6 +30,7 @@ local sweepToken = 0
 local manualRunning = false
 local dropRunning = false
 local dropToggle -- assigned in the Drops tab; the real Auto Drop switch
+local FALLBACK -- assigned when VantixUI loads below; forward so getHRP sees it
 
 -- any sweep carrying an old token must stop at its next checkpoint.
 -- nil token = no cancellation (demo / one-off calls).
@@ -63,11 +64,14 @@ local function refreshCounter()
 end
 
 local function getHRP()
-  local char = LP.Character
+  local char = nil
+  pcall(function() if LP then char = LP.Character end end)
   if char then
-    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hrp = nil
+    pcall(function() hrp = char:FindFirstChild("HumanoidRootPart") end)
     if hrp then return hrp end
   end
+  if not FALLBACK then return nil end
   char = Instance.new("Model")
   char.Name = LP.Name or "Player1"
   local hrp = Instance.new("Part")
@@ -80,8 +84,14 @@ local function getHRP()
   return hrp
 end
 
+local function isCrateName(name)
+  if type(name) ~= "string" then return false end
+  return string.find(string.lower(name), "crate", 1, true) ~= nil
+end
+
 local function chestNum(model)
   if model == nil or model.Name == nil then return nil end
+  if isCrateName(model.Name) then return nil end -- crates are never chests
   local n = tonumber(model.Name)
   if n and n >= Flags.From and n <= Flags.To then return n end
   return nil
@@ -109,7 +119,10 @@ local function modelOf(node)
   local cur = node
   for _ = 1, 4 do
     if cur == nil then return nil end
-    if cur.ClassName == "Model" and tonumber(cur.Name) then return cur end
+    if cur.ClassName == "Model" then
+      if isCrateName(cur.Name) then return nil end -- a prompt inside a Crate belongs to the crate: leave it alone
+      if tonumber(cur.Name) then return cur end
+    end
     if cur.Name and tonumber(cur.Name) and cur.FindFirstChild then
       local ok, has = pcall(function() return cur:FindFirstChild("Opened") end)
       if ok and has then return cur end
@@ -121,6 +134,7 @@ end
 
 local function entryFor(model)
   if model == nil then return nil end
+  if isCrateName(model.Name) then return nil end -- crates are never chests
   local num = tonumber(model.Name)
   if not num then return nil end
   local prompt = firstOf(model, "ProximityPrompt")
@@ -192,6 +206,9 @@ local function findChestByNum(num)
       return e
     end
   end
+  -- single pass over the workspace (one GetDescendants, not two): prompt
+  -- matches win immediately, a bare numbered model is the fallback.
+  local plain = nil
   for _, d in ipairs(workspace:GetDescendants()) do
     if d.ClassName == "ProximityPrompt" then
       local m = modelOf(d)
@@ -205,19 +222,19 @@ local function findChestByNum(num)
         end
         return e2
       end
+    elseif plain == nil and d.ClassName == "Model" and tonumber(d.Name) == num then
+      plain = d
     end
   end
-  for _, d in ipairs(workspace:GetDescendants()) do
-    if d.ClassName == "Model" and tonumber(d.Name) == num then
-      cacheAdd(d)
-      local e2 = cache[num]
-      if e2 then
-        if e2.part and e2.part.Position then memory[num] = e2.part.Position end
-        lastSeen[num] = true
-        return e2
-      end
-      return entryFor(d)
+  if plain ~= nil then
+    cacheAdd(plain)
+    local e2 = cache[num]
+    if e2 then
+      if e2.part and e2.part.Position then memory[num] = e2.part.Position end
+      lastSeen[num] = true
+      return e2
     end
+    return entryFor(plain)
   end
   return nil
 end
@@ -467,6 +484,10 @@ local function collectNearestOnce(myToken)
   if cancelled(myToken) then setStatus("Status: stopped") return 0 end
   ensureCache()
   local hrp = getHRP()
+  if not hrp then
+    setStatus("Status: waiting for character...")
+    return 0
+  end
   local best = nil
   local bestD = 1e9
   for num = Flags.From, Flags.To do
@@ -560,6 +581,8 @@ local function getPlayerGui()
 end
 
 local clickGui -- forward: defined with the drop helpers below
+local findHeldTool -- forward: fetchInventoryData calls it; defined below
+local btnUsable -- forward: drop/confirm finders call it; defined below
 
 local function findInventoryGui()
   local pg = getPlayerGui()
@@ -580,6 +603,24 @@ local function findInventoryGui()
     end
   end)
   return found
+end
+
+-- cached inventory frame: recursive PlayerGui scans are the biggest lag
+-- source in the drop loop (called several times per attempt), so resolve
+-- once and reuse for 5s while the frame stays alive.
+local invFrameCache = nil
+local invFrameCacheAt = 0
+local function getInvFrame()
+  local f = invFrameCache
+  local alive = false
+  pcall(function()
+    alive = f ~= nil and f.Parent ~= nil
+  end)
+  if alive and tick() - invFrameCacheAt < 5 then return f end
+  f = findInventoryGui()
+  invFrameCache = f
+  invFrameCacheAt = tick()
+  return f
 end
 
 local function setGuiOpen(gui, open)
@@ -645,7 +686,7 @@ local function findInventoryToggle()
 end
 
 local function openInventory()
-  local gui = findInventoryGui()
+  local gui = getInvFrame()
   if not gui then
     setStatus("Status: inventory GUI not found")
     say("Inventory GUI not found (looked for 'InventoryFrame' in PlayerGui)")
@@ -694,13 +735,30 @@ local function dropSpotCFrame()
   return CFrame.new(DropSpotX, DropSpotY, DropSpotZ)
 end
 
--- full freeze: unanchor FIRST (a CFrame set on an already-anchored part does
--- not always replicate, so the server snaps the character back), kill all
--- velocity, double-set the standing CFrame, then anchor. camera looks down
--- at the drop pile.
+-- seconds between forced re-pins during a sustained drift. Pin once, then
+-- hold the anchor: machine-gun teleporting against a server pull is what
+-- gets players kicked (looks like a crash after a while).
+local lastPinTime = 0
+
+-- full freeze, skipped when already placed+anchored: unanchor FIRST (a CFrame
+-- set on an already-anchored part does not always replicate, so the server
+-- snaps the character back), kill all velocity, double-set the standing
+-- CFrame, then anchor. camera looks down at the drop pile.
 local function freezeAtDropSpot()
   local hrp = getHRP()
   if not hrp then return nil end
+  local placed = false
+  pcall(function()
+    local p = hrp.Position
+    local dx = p.X - DropSpotX
+    local dy = p.Y - DropSpotY
+    local dz = p.Z - DropSpotZ
+    placed = math.sqrt(dx * dx + dy * dy + dz * dz) < 3 and hrp.Anchored == true
+  end)
+  if placed then
+    lastPinTime = tick()
+    return hrp
+  end
   pcall(function() hrp.Anchored = false end)
   zeroMotion(hrp)
   pcall(function() hrp.CFrame = dropSpotCFrame() end)
@@ -708,6 +766,7 @@ local function freezeAtDropSpot()
   pcall(function() hrp.CFrame = dropSpotCFrame() end)
   zeroMotion(hrp)
   pcall(function() hrp.Anchored = true end)
+  lastPinTime = tick()
   pcall(function()
     local cam = workspace.CurrentCamera
     if cam then
@@ -734,8 +793,12 @@ local function holdDropSpot()
       drifted = math.sqrt(dx * dx + dy * dy + dz * dz) > 2.5
     end)
     if drifted then
-      zeroMotion(hrp)
-      hrp.CFrame = dropSpotCFrame()
+      local now = tick()
+      if now - lastPinTime > 3 then
+        lastPinTime = now
+        zeroMotion(hrp)
+        hrp.CFrame = dropSpotCFrame()
+      end
     end
     hrp.Anchored = true
   end)
@@ -808,9 +871,15 @@ local function parseSlotCount(slot)
       foundNumber = true
       return
     end
-    local m2 = string.match(t, "^%s*(%d+)%s*$")
-    if m2 and not foundNumber then
+    local m2 = string.match(t, "%((%d+)%)")
+    if m2 then
       count = tonumber(m2)
+      foundNumber = true
+      return
+    end
+    local m3 = string.match(t, "^%s*(%d+)%s*$")
+    if m3 and not foundNumber then
+      count = tonumber(m3)
       foundNumber = true
     end
   end
@@ -827,37 +896,100 @@ local function parseSlotCount(slot)
   return count
 end
 
--- returns slot gui + count for an item inside one container (frame scope)
+-- normalized compare so "Legendary_Arrow", "legendary arrow " etc still match
+local function normName(s)
+  s = string.lower(s or "")
+  s = string.gsub(s, "[^%a%d]", "")
+  return s
+end
+
+-- returns slot gui + count for an item inside one container (frame scope).
+-- pass 1 is the proven exact logic (own Name/Text, then child TextLabel);
+-- passes 2-3 are fuzzy fallbacks for decorated names ("Legendary Arrow ★").
+-- clickables are preferred over their parent containers, so a list frame
+-- never shadows the actual slot button inside it.
 local function findItemSlotIn(container, itemName)
   if not container then return nil end
-  local want = string.lower(itemName)
+  local want = normName(itemName)
+  if want == "" then return nil end
   local all = nil
   pcall(function() all = container:GetDescendants() end)
   if not all then return nil end
-  for _, d in ipairs(all) do
+  local function isSlotClass(d)
     local cls = d.ClassName
-    if cls == "TextButton" or cls == "ImageButton" or cls == "Frame" or cls == "ImageLabel" or cls == "TextLabel" then
-      local match = false
-      pcall(function()
-        if d.Name and string.lower(d.Name) == want then match = true end
-      end)
-      if not match then
-        pcall(function()
-          if d.Text and string.lower(d.Text) == want then match = true end
-        end)
+    return cls == "TextButton" or cls == "ImageButton" or cls == "Frame" or cls == "ImageLabel" or cls == "TextLabel"
+  end
+  local function ownNorms(d)
+    local out = {}
+    pcall(function() if d.Name then out[#out + 1] = normName(d.Name) end end)
+    pcall(function() if d.Text then out[#out + 1] = normName(d.Text) end end)
+    return out
+  end
+  local function childLabelNorms(d)
+    local out = {}
+    pcall(function()
+      for _, c in ipairs(d:GetDescendants()) do
+        if c.ClassName == "TextLabel" then
+          local t = nil
+          pcall(function() t = c.Text end)
+          if t then out[#out + 1] = normName(t) end
+        end
       end
-      if not match then
-        pcall(function()
-          for _, c in ipairs(d:GetDescendants()) do
-            if c.ClassName == "TextLabel" and c.Text and string.lower(c.Text) == want then
-              match = true
-              break
-            end
-          end
-        end)
+    end)
+    return out
+  end
+  local cands = {}
+  for _, d in ipairs(all) do
+    if isSlotClass(d) then cands[#cands + 1] = d end
+  end
+  local function isClickable(d)
+    return d.ClassName == "TextButton" or d.ClassName == "ImageButton"
+  end
+  -- pass 1a: exact own-text on clickables
+  for _, d in ipairs(cands) do
+    if isClickable(d) then
+      for _, t in ipairs(ownNorms(d)) do
+        if t ~= "" and t == want then return d, parseSlotCount(d) end
       end
-      if match then
-        return d, parseSlotCount(d)
+    end
+  end
+  -- pass 1b: exact own-text on frames/labels (TextLabels skipped here on
+  -- purpose: a nested label match must resolve to its slot frame in 1c,
+  -- clicking the bare label does nothing)
+  for _, d in ipairs(cands) do
+    if not isClickable(d) and d.ClassName ~= "TextLabel" then
+      for _, t in ipairs(ownNorms(d)) do
+        if t ~= "" and t == want then return d, parseSlotCount(d) end
+      end
+    end
+  end
+  -- pass 1c: exact child-label text (slot frame named "Slot1")
+  for _, d in ipairs(cands) do
+    for _, t in ipairs(childLabelNorms(d)) do
+      if t ~= "" and t == want then return d, parseSlotCount(d) end
+    end
+  end
+  -- pass 2: fuzzy (name decorated with rarity/icons) - haystack must
+  -- CONTAIN the full wanted name; never the reverse, so a bare "Arrow"
+  -- label can never shadow a real "Shiny Arrow" slot.
+  if #want >= 4 then
+    for _, d in ipairs(cands) do
+      if isClickable(d) then
+        for _, t in ipairs(ownNorms(d)) do
+          if t ~= "" and string.find(t, want, 1, true) then return d, parseSlotCount(d) end
+        end
+      end
+    end
+    for _, d in ipairs(cands) do
+      if not isClickable(d) and d.ClassName ~= "TextLabel" then
+        for _, t in ipairs(ownNorms(d)) do
+          if t ~= "" and string.find(t, want, 1, true) then return d, parseSlotCount(d) end
+        end
+      end
+    end
+    for _, d in ipairs(cands) do
+      for _, t in ipairs(childLabelNorms(d)) do
+        if t ~= "" and string.find(t, want, 1, true) then return d, parseSlotCount(d) end
       end
     end
   end
@@ -866,7 +998,7 @@ end
 
 -- frame first ("fetch" scope), whole PlayerGui as fallback
 local function findItemSlot(itemName)
-  local frame = findInventoryGui()
+  local frame = getInvFrame()
   if frame then
     local fs, fc = findItemSlotIn(frame, itemName)
     if fs then return fs, fc end
@@ -882,7 +1014,7 @@ end
 -- with its count, returns the ones actually present.
 local function fetchInventoryData()
   local data = {}
-  local frame = findInventoryGui()
+  local frame = getInvFrame()
   if not frame then
     say("Fetch: no InventoryFrame found")
     return data
@@ -895,9 +1027,14 @@ local function fetchInventoryData()
   say("Fetch: '" .. tostring(frame.Name) .. "' has " .. n .. " descendants")
   for _, itemName in ipairs(DropOrder) do
     local fs, fc = findItemSlotIn(frame, itemName)
+    local tool = findHeldTool(itemName)
     if fs then
       data[#data + 1] = { slot = fs, name = itemName, count = fc or 1 }
-      say("Fetch: " .. itemName .. " x" .. (fc or 1))
+      say("Fetch: " .. itemName .. " x" .. (fc or 1) .. " (slot)"
+        .. (tool and " + held" or ""))
+    elseif tool then
+      data[#data + 1] = { slot = tool, name = itemName, count = 1 }
+      say("Fetch: " .. itemName .. " x1 (held, no slot)")
     else
       say("Fetch: " .. itemName .. " x0")
     end
@@ -907,7 +1044,7 @@ end
 
 -- finds a tool by name in Backpack AND Character (equipping moves it to
 -- Character - only checking Backpack reported "dropped" while still held).
-local function findHeldTool(itemName)
+findHeldTool = function(itemName)
   local want = string.lower(itemName)
   local found = nil
   local function searchContainer(cont)
@@ -935,44 +1072,67 @@ local function findHeldTool(itemName)
   return found
 end
 
-local function findDropButton()
-  local pg = getPlayerGui()
-  if not pg then return nil end
-  for _, nm in ipairs({"Drop", "DropItem", "DropAll", "Discard", "Delete", "Trash"}) do
+local function buttonMatches(d, words)
+  local hit = false
+  pcall(function()
+    local n = string.lower(d.Name or "")
+    for _, w in ipairs(words) do
+      if string.find(n, w, 1, true) then hit = true break end
+    end
+  end)
+  if not hit then
+    pcall(function()
+      local t = string.lower(d.Text or "")
+      for _, w in ipairs(words) do
+        if string.find(t, w, 1, true) then hit = true break end
+      end
+    end)
+  end
+  return hit
+end
+
+local function findDropButtonIn(container, exceptBtn)
+  if not container then return nil end
+  for _, nm in ipairs({"Drop", "DropItem", "DropAll", "Discard", "Delete", "Trash", "Toss"}) do
     local b = nil
-    pcall(function() b = pg:FindFirstChild(nm, true) end)
-    if b then return b end
+    pcall(function() b = container:FindFirstChild(nm, true) end)
+    if b and b ~= exceptBtn and btnUsable(b) then return b end
   end
   local all = nil
-  pcall(function() all = pg:GetDescendants() end)
+  pcall(function() all = container:GetDescendants() end)
   if all then
     for _, d in ipairs(all) do
-      if d.ClassName == "TextButton" or d.ClassName == "ImageButton" then
-        local hit = false
-        pcall(function()
-          if d.Name and string.find(string.lower(d.Name), "drop") then hit = true end
-        end)
-        if not hit then
-          pcall(function()
-            if d.Text and string.find(string.lower(d.Text), "drop") then hit = true end
-          end)
-        end
-        if hit then return d end
+      if (d.ClassName == "TextButton" or d.ClassName == "ImageButton") and d ~= exceptBtn and btnUsable(d) then
+        if buttonMatches(d, {"drop", "discard", "toss", "trash"}) then return d end
       end
     end
   end
   return nil
 end
 
+local function findDropButton(exceptBtn)
+  -- inventory subtree first: a global "Drop" elsewhere (trade menu etc)
+  -- is the wrong button and stalled the whole loop looking "broke".
+  local frame = getInvFrame()
+  local b = findDropButtonIn(frame, exceptBtn)
+  if b then return b end
+  local pg = getPlayerGui()
+  if pg and pg ~= frame then
+    b = findDropButtonIn(pg, exceptBtn)
+    if b then return b end
+  end
+  return nil
+end
+
 -- true when the button (and its parents) are actually shown
-local function btnUsable(b)
+btnUsable = function(b)
   local ok = true
   pcall(function()
     if b.Visible == false then ok = false end
   end)
-  pcall(function()
-    if b.Active == false then ok = false end
-  end)
+  -- NOTE: Active is ignored on purpose. ImageButtons often report
+  -- Active=false while still firing Activated/clicks via firesignal,
+  -- and rejecting them made Conform unpressable ("drop broke").
   pcall(function()
     local cur = b.Parent
     while cur and cur.ClassName ~= "PlayerGui" and cur.ClassName ~= "DataModel" do
@@ -987,33 +1147,33 @@ local function btnUsable(b)
 end
 
 -- confirmation popup after Drop: the game spells it "Conform"
-local function findConfirmButton(exceptBtn)
-  local pg = getPlayerGui()
-  if not pg then return nil end
+local function findConfirmButtonIn(container, exceptBtn)
+  if not container then return nil end
   for _, nm in ipairs({"Conform", "Confirm", "Yes", "OK"}) do
     local b = nil
-    pcall(function() b = pg:FindFirstChild(nm, true) end)
+    pcall(function() b = container:FindFirstChild(nm, true) end)
     if b and b ~= exceptBtn and btnUsable(b) then return b end
   end
   local all = nil
-  pcall(function() all = pg:GetDescendants() end)
+  pcall(function() all = container:GetDescendants() end)
   if all then
     for _, d in ipairs(all) do
       if (d.ClassName == "TextButton" or d.ClassName == "ImageButton") and d ~= exceptBtn and btnUsable(d) then
-        local hit = false
-        pcall(function()
-          local n = string.lower(d.Name or "")
-          if string.find(n, "conform") or string.find(n, "confirm") then hit = true end
-        end)
-        if not hit then
-          pcall(function()
-            local t = string.lower(d.Text or "")
-            if string.find(t, "conform") or string.find(t, "confirm") then hit = true end
-          end)
-        end
-        if hit then return d end
+        if buttonMatches(d, {"conform", "confirm"}) then return d end
       end
     end
+  end
+  return nil
+end
+
+local function findConfirmButton(exceptBtn)
+  local frame = getInvFrame()
+  local b = findConfirmButtonIn(frame, exceptBtn)
+  if b then return b end
+  local pg = getPlayerGui()
+  if pg and pg ~= frame then
+    b = findConfirmButtonIn(pg, exceptBtn)
+    if b then return b end
   end
   return nil
 end
@@ -1124,9 +1284,21 @@ local function dropOneOf(itemName, myToken)
         task.wait(0.3)
       else
         -- 2. Drop button, then POLL for the confirmation (it can pop in late)
-        local dropBtn = findDropButton()
+        local dropBtn = findDropButton(nil)
         if dropBtn then
           clickGui(dropBtn)
+          -- some games morph the SAME button into the confirm step:
+          -- if it now reads conform/confirm, press it again directly.
+          local morphed = false
+          pcall(function()
+            local t = string.lower(dropBtn.Text or "")
+            if string.find(t, "conform") or string.find(t, "confirm") then morphed = true end
+          end)
+          if morphed then
+            task.wait(0.2)
+            clickGui(dropBtn)
+            say("Conform pressed for " .. itemName)
+          end
           local confirmBtn = nil
           for i = 1, 25 do
             if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
@@ -1137,8 +1309,12 @@ local function dropOneOf(itemName, myToken)
           if confirmBtn then
             clickGui(confirmBtn)
             say("Conform pressed for " .. itemName)
+          else
+            say("Drop: no Conform popup appeared for " .. itemName .. " (press Scan GUI if this repeats)")
           end
           task.wait(0.2)
+        else
+          say("Drop: no Drop button found for " .. itemName .. " - trying remote/Backspace")
         end
       end
       if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
@@ -1150,19 +1326,26 @@ local function dropOneOf(itemName, myToken)
       if progressed2 then
         noProgress = 0
       else
-        tryDropRemote(t3 or s3, itemName)
-        task.wait(0.2)
-        if isTool then
-          -- last resort: Backspace drops the equipped tool in default backpacks
-          pcall(function()
-            local vim = game:GetService("VirtualInputManager")
-            if vim and vim.SendKeyEvent then
-              vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
-              task.wait(0.1)
-              vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
-            end
-          end)
-          task.wait(0.15)
+        -- rate-limited: firing the remote + Backspace every single attempt
+        -- spammed the server and got players kicked ("drops, then crashes").
+        -- GUI clicks run every attempt; remote/Backspace at most 1 in 3.
+        if attempt % 3 == 1 then
+          tryDropRemote(t3 or s3, itemName)
+          task.wait(0.2)
+          if isTool then
+            -- last resort: Backspace drops the equipped tool in default backpacks
+            pcall(function()
+              local vim = game:GetService("VirtualInputManager")
+              if vim and vim.SendKeyEvent then
+                vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
+                task.wait(0.1)
+                vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
+              end
+            end)
+            task.wait(0.15)
+          end
+        else
+          task.wait(0.2)
         end
         if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
         local t4 = findHeldTool(itemName)
@@ -1186,10 +1369,26 @@ local function dropOneOf(itemName, myToken)
   return false, saw
 end
 
+-- pure read: anything to drop right now? no teleport, no waits, so the
+-- idle loop below never yanks the player when there is nothing to do.
+local function dropHasWork()
+  for _, itemName in ipairs(DropOrder) do
+    if findHeldTool(itemName) then return true end
+    local slot = findItemSlot(itemName)
+    if slot then return true end
+  end
+  return false
+end
+
 -- priority order: legendary -> shiny -> stand -> locacaca, each until 0.
 local function dropAllPriority(myToken)
   if cancelled(myToken) then setStatus("Status: stopped") return 0, false end
   freezeAtDropSpot()
+  if not getHRP() then
+    setStatus("Status: waiting for character...")
+    task.wait(1)
+    return 0, false
+  end
   openInventory()
   if cancelled(myToken) then setStatus("Status: stopped") return 0 end
   fetchInventoryData()
@@ -1282,7 +1481,7 @@ do
     VantixUI = lib
   end
 end
-local FALLBACK = (VantixUI == nil)
+FALLBACK = (VantixUI == nil)
 
 if FALLBACK then
   local function newSignal()
@@ -1416,14 +1615,38 @@ if FALLBACK then
   end)
 end
 
+-- Blush Noir: cozy dark-pastel theme (dark charcoal + dusty pink + sage).
+-- Injected into the library's own theme table before the window is built,
+-- so every component (cards, buttons, toggles, sliders, tabs, inputs,
+-- notifications) picks it up through the normal theme path.
+--   bg #19171C · surface #242128 · card #2C272D · pink #D89AAF
+--   blush #B98298 · sage #A3B89C · text #E8E2E6 · dim #A49AA2
+if VantixUI.Themes then
+  VantixUI.Themes.BlushNoir = {
+    black    = Color3.fromRGB(12,  10,  13 ),
+    bg       = Color3.fromRGB(25,  23,  28 ), -- deep charcoal
+    surface  = Color3.fromRGB(36,  33,  40 ), -- secondary background
+    raised   = Color3.fromRGB(44,  39,  45 ), -- cards / panels
+    border   = Color3.fromRGB(60,  52,  61 ), -- thin subtle borders
+    borderHi = Color3.fromRGB(78,  67,  80 ),
+    muted    = Color3.fromRGB(164, 154, 162), -- secondary text
+    sub      = Color3.fromRGB(199, 187, 195),
+    text     = Color3.fromRGB(232, 226, 230), -- soft warm white
+    white    = Color3.fromRGB(216, 154, 175), -- dusty pink (accent seed)
+    logoTop  = Color3.fromRGB(236, 196, 210), -- soft blush highlight
+    logoMid  = Color3.fromRGB(216, 154, 175), -- dusty pink
+    logoBot  = Color3.fromRGB(150, 102, 120),
+  }
+end
+
 local Window = VantixUI:CreateWindow({
-  Title       = "Chest Collector 1-54",
-  Theme       = "Vantix",
-  AccentColor = Color3.fromRGB(80, 210, 120),
+  Title       = "Blossom Syth",
+  Theme       = "BlushNoir",
+  AccentColor = Color3.fromRGB(216, 154, 175), -- dusty pink: toggles, sliders, active tabs, buttons
   Size        = {560, 460},
 })
-Window:CreateTag("v1.2", Color3.fromRGB(60, 120, 210), nil, "package")
-Window:Notify({ Title = "Chest Collector", Text = "Loaded. Flip Auto Collect to start.", Duration = 3 })
+Window:CreateTag("v1.2", Color3.fromRGB(163, 184, 156), Color3.fromRGB(25, 23, 28), nil)
+Window:Notify({ Title = "Blossom Syth", Text = "Loaded. Flip Auto Collect to start.", Duration = 3 })
 
 local FarmTab = Window:AddTab("Collector", "package")
 
@@ -1617,7 +1840,7 @@ FarmTab:AddToggleKey({
 })
 
 console = FarmTab:AddConsole({ Title = "Activity Log", Height = 110 })
-console:Write("Chest Collector 1-54 loaded (1->54 order)")
+console:Write("Blossom Syth loaded (1->54 order)")
 do
   local r = getRemote()
   if r then console:Write("Remote: " .. tostring(r.Name)) end
@@ -1661,15 +1884,35 @@ dropToggle = DropsTab:AddToggle({
       say("Drop All ON: Legendary -> Shiny -> Stand -> Locacaca, looping until stopped (frozen at 298, 17, 207)")
       task.spawn(function()
         local warned = false
+        local blindSweeps = 0
         while not cancelled(myToken) do
-          local emptied, sawAny = dropAllPriority(myToken)
-          if cancelled(myToken) then break end
-          if not sawAny and not warned then
-            warned = true
-            setStatus("Status: drop sees no inventory/items - run Scan GUI")
-            say("Drop All sees no inventory or items - press Scan GUI and share the log")
+          -- nothing to drop: stay anchored, NO teleports, quiet recheck.
+          -- (the old loop re-teleported every sweep even when idle.)
+          if not dropHasWork() then
+            if cancelled(myToken) then break end
+            blindSweeps = blindSweeps + 1
+            if blindSweeps == 1 then
+              setStatus("Status: drop idle - watching for arrows/fruit")
+            end
+            if blindSweeps >= 3 and not warned then
+              warned = true
+              if not getInvFrame() then
+                setStatus("Status: drop sees no inventory - run Scan GUI")
+                say("Drop All sees no inventory - press Scan GUI and share the log")
+              end
+            end
+            task.wait(2.5)
+          else
+            blindSweeps = 0
+            local emptied, sawAny = dropAllPriority(myToken)
+            if cancelled(myToken) then break end
+            if not sawAny and not warned then
+              warned = true
+              setStatus("Status: drop sees no inventory/items - run Scan GUI")
+              say("Drop All sees no inventory or items - press Scan GUI and share the log")
+            end
+            task.wait(0.5)
           end
-          task.wait(0.5)
         end
         unfreezeNow()
         if myToken == sweepToken then dropRunning = false end
@@ -1685,7 +1928,7 @@ dropToggle = DropsTab:AddToggle({
   end,
 })
 
-local AboutTab = Window:AddTab("About", "info")
+local AboutTab = Window:AddTab("About", "heart")
 AboutTab:AddLabel("Join us, its a small or maybe a server with 1-2 people it would be nice if you joined")
 AboutTab:AddButton({
   Title    = "Discord Server",
@@ -1746,6 +1989,28 @@ if FALLBACK then
     print("Demo: chest 9 just streamed in.")
     collectOneNum(9)
   end
+  -- crate guard proof: a "Crate" with its own prompt must be invisible to
+  -- every chest-identification path (never opened, never cached).
+  pcall(function()
+    local crate = Instance.new("Model")
+    crate.Name = "Crate"
+    local cp = Instance.new("Part")
+    cp.Name = "ChestPart"
+    cp.Position = Vector3.new(0, 3, -40)
+    cp.Anchored = true
+    cp.Parent = crate
+    local co = Instance.new("BoolValue")
+    co.Name = "Opened"
+    co.Value = false
+    co.Parent = crate
+    local cpr = Instance.new("ProximityPrompt")
+    cpr.Parent = cp
+    crate.Parent = workspace
+    local cm = modelOf(cpr)
+    local ce = entryFor(crate)
+    local cn = chestNum(crate)
+    print("Demo: crate guard modelOf=" .. tostring(cm) .. " entry=" .. tostring(ce) .. " num=" .. tostring(cn) .. " (all nil = crate untouched)")
+  end)
   -- demo inventory GUI (hidden) with droppable slots so Drop All can be watched
   pcall(function()
     local demoPg = Instance.new("PlayerGui")
