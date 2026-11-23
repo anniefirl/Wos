@@ -558,11 +558,16 @@ local function getPlayerGui()
   return pg
 end
 
+local clickGui -- forward: defined with the drop helpers below
+
 local function findInventoryGui()
   local pg = getPlayerGui()
   if not pg then return nil end
+  -- this game's frame first, then generic matches
   local exact = nil
-  pcall(function() exact = pg:FindFirstChild("Inventory") end)
+  pcall(function() exact = pg:FindFirstChild("InventoryFrame", true) end)
+  if exact then return exact end
+  pcall(function() exact = pg:FindFirstChild("Inventory", true) end)
   if exact then return exact end
   local found = nil
   pcall(function()
@@ -581,10 +586,7 @@ local function setGuiOpen(gui, open)
   pcall(function()
     if gui.ClassName == "ScreenGui" then
       gui.Enabled = open
-    end
-  end)
-  pcall(function()
-    if gui.IsA and gui:IsA("GuiObject") then
+    else
       gui.Visible = open
     end
   end)
@@ -599,16 +601,75 @@ local function setGuiOpen(gui, open)
   end)
 end
 
+local function isGuiOpen(gui)
+  local open = true
+  pcall(function()
+    if gui.ClassName == "ScreenGui" then
+      open = gui.Enabled == true
+    elseif gui.Visible ~= nil then
+      open = gui.Visible == true
+    end
+  end)
+  return open
+end
+
+-- the button players tap to open the bag (used when forcing Visible is not enough)
+local function findInventoryToggle()
+  local pg = getPlayerGui()
+  if not pg then return nil end
+  local all = nil
+  pcall(function() all = pg:GetDescendants() end)
+  if not all then return nil end
+  for _, d in ipairs(all) do
+    if d.ClassName == "TextButton" or d.ClassName == "ImageButton" then
+      local vis = true
+      pcall(function() vis = d.Visible ~= false end)
+      if vis then
+        local hit = false
+        pcall(function()
+          local n = string.lower(d.Name or "")
+          if string.find(n, "invent") or string.find(n, "bag") or string.find(n, "backpack") then hit = true end
+        end)
+        if not hit then
+          pcall(function()
+            local t = string.lower(d.Text or "")
+            if string.find(t, "invent") or string.find(t, "bag") or string.find(t, "backpack") then hit = true end
+          end)
+        end
+        if hit then return d end
+      end
+    end
+  end
+  return nil
+end
+
 local function openInventory()
   local gui = findInventoryGui()
   if not gui then
     setStatus("Status: inventory GUI not found")
-    say("Inventory GUI not found (looked for 'Inventory' in PlayerGui)")
+    say("Inventory GUI not found (looked for 'InventoryFrame' in PlayerGui)")
     return false
   end
   setGuiOpen(gui, true)
-  setStatus("Status: inventory open")
-  say("Inventory opened")
+  task.wait(0.3)
+  if isGuiOpen(gui) then
+    setStatus("Status: inventory open")
+    say("Inventory opened")
+    return true
+  end
+  -- game keeps it shut: tap its own toggle button like a player would
+  local toggle = findInventoryToggle()
+  if toggle then
+    clickGui(toggle)
+    task.wait(0.5)
+    if isGuiOpen(gui) then
+      setStatus("Status: inventory open")
+      say("Inventory opened")
+      return true
+    end
+  end
+  setStatus("Status: inventory may still be closed - continuing anyway")
+  say("Inventory would not stay open - continuing anyway")
   return true
 end
 
@@ -692,7 +753,7 @@ local DropOrder = {"Legendary Arrow", "Shiny Arrow", "Stand Arrow", "Locacaca Fr
 -- clicks a GuiButton the way a real click does: fire EVERY signal the game
 -- could listen on (down + click + activated + connections + Activate).
 -- never throws. returns true if anything was attempted.
-local function clickGui(btn)
+clickGui = function(btn)
   if btn == nil then return false end
   local clicked = false
   pcall(function()
@@ -765,13 +826,12 @@ local function parseSlotCount(slot)
   return count
 end
 
--- returns slot gui + count, or nil when none of this item is left in the inventory
-local function findItemSlot(itemName)
-  local pg = getPlayerGui()
-  if not pg then return nil end
+-- returns slot gui + count for an item inside one container (frame scope)
+local function findItemSlotIn(container, itemName)
+  if not container then return nil end
   local want = string.lower(itemName)
   local all = nil
-  pcall(function() all = pg:GetDescendants() end)
+  pcall(function() all = container:GetDescendants() end)
   if not all then return nil end
   for _, d in ipairs(all) do
     local cls = d.ClassName
@@ -803,7 +863,63 @@ local function findItemSlot(itemName)
   return nil
 end
 
-local function findBackpackTool(itemName)
+-- frame first ("fetch" scope), whole PlayerGui as fallback
+local function findItemSlot(itemName)
+  local frame = findInventoryGui()
+  if frame then
+    local fs, fc = findItemSlotIn(frame, itemName)
+    if fs then return fs, fc end
+  end
+  local pg = getPlayerGui()
+  if pg then
+    return findItemSlotIn(pg, itemName)
+  end
+  return nil
+end
+
+-- reads the frame's item entries ("fetch data"): logs every DropOrder item
+-- with its count, returns the ones actually present.
+local function fetchInventoryData()
+  local data = {}
+  local frame = findInventoryGui()
+  if not frame then
+    say("Fetch: no InventoryFrame found")
+    return data
+  end
+  local n = 0
+  pcall(function()
+    local all = frame:GetDescendants()
+    if all then n = #all end
+  end)
+  say("Fetch: '" .. tostring(frame.Name) .. "' has " .. n .. " descendants")
+  for _, itemName in ipairs(DropOrder) do
+    local fs, fc = findItemSlotIn(frame, itemName)
+    if fs then
+      data[#data + 1] = { slot = fs, name = itemName, count = fc or 1 }
+      say("Fetch: " .. itemName .. " x" .. (fc or 1))
+    else
+      say("Fetch: " .. itemName .. " x0")
+    end
+  end
+  return data
+end
+
+-- finds a tool by name in Backpack AND Character (equipping moves it to
+-- Character - only checking Backpack reported "dropped" while still held).
+local function findHeldTool(itemName)
+  local want = string.lower(itemName)
+  local found = nil
+  local function searchContainer(cont)
+    if not cont or found then return end
+    pcall(function()
+      for _, c in ipairs(cont:GetChildren()) do
+        if c.Name and string.lower(c.Name) == want then
+          found = c
+          break
+        end
+      end
+    end)
+  end
   local pack = nil
   pcall(function()
     if LP and LP.FindFirstChild then pack = LP:FindFirstChild("Backpack") end
@@ -811,17 +927,10 @@ local function findBackpackTool(itemName)
   if not pack then
     pcall(function() if LP then pack = LP.Backpack end end)
   end
-  if not pack then return nil end
-  local want = string.lower(itemName)
-  local found = nil
-  pcall(function()
-    for _, c in ipairs(pack:GetChildren()) do
-      if c.Name and string.lower(c.Name) == want then
-        found = c
-        break
-      end
-    end
-  end)
+  searchContainer(pack)
+  local char = nil
+  pcall(function() if LP then char = LP.Character end end)
+  searchContainer(char)
   return found
 end
 
@@ -896,7 +1005,8 @@ local function tryDropRemote(handle, itemName)
   end
 end
 
--- drops ONE item name until its count is 0. returns true when empty.
+-- drops ONE item name until its count is 0. held tools (backpack + character)
+-- first, GUI slots second. returns ok, saw.
 local function dropOneOf(itemName, myToken)
   local noProgress = 0
   local saw = false
@@ -906,23 +1016,24 @@ local function dropOneOf(itemName, myToken)
     local slot = nil
     local count = 0
     local isTool = false
-    local s, c = findItemSlot(itemName)
-    if s then
-      slot = s
-      count = c or 1
-      saw = true
-    else
-      local tool = findBackpackTool(itemName)
-      if not tool then
-        return true, saw
-      end
+    local tool = findHeldTool(itemName)
+    if tool then
       slot = tool
       count = 1
       isTool = true
       saw = true
+    else
+      local gs, gc = findItemSlot(itemName)
+      if not gs then
+        return true, saw
+      end
+      slot = gs
+      count = gc or 1
+      saw = true
     end
     setStatus("Status: drop [" .. itemName .. "] (" .. count .. " left)...")
     if isTool then
+      -- equip it so the Drop button / Backspace has something to drop
       pcall(function()
         local char = LP.Character
         local hum = nil
@@ -938,50 +1049,53 @@ local function dropOneOf(itemName, myToken)
       task.wait(0.4)
     end
     if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-    -- recount: gone means one click dropped it
-    local s2, c2 = findItemSlot(itemName)
-    local t2 = nil
-    if not s2 then t2 = findBackpackTool(itemName) end
-    if not s2 and not t2 then
+    -- recount tools first: gone from hands AND pack means actually dropped
+    local t2 = findHeldTool(itemName)
+    local s2, c2 = nil, nil
+    if not t2 then s2, c2 = findItemSlot(itemName) end
+    if not t2 and not s2 then
       return true, saw
     end
-    local left2 = s2 and (c2 or 1) or 1
-    if s2 and left2 < count then
+    local progressed = (not isTool) and s2 and (c2 or 1) < count
+    if progressed then
       noProgress = 0
     else
-      -- click alone did nothing: use the Drop button, then the remote
+      -- select/equip alone did nothing: Drop button, then remote, then Backspace
       local dropBtn = findDropButton()
       if dropBtn then
         clickGui(dropBtn)
         task.wait(0.5)
         if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
-        local s3, c3 = findItemSlot(itemName)
-        local t3 = nil
-        if not s3 then t3 = findBackpackTool(itemName) end
-        if not s3 and not t3 then return true, saw end
-        local left3 = s3 and (c3 or 1) or 1
-        if s3 and left3 < count then
-          noProgress = 0
-        else
-          tryDropRemote(s3 or t3, itemName)
-          task.wait(0.5)
-          local s4, c4 = findItemSlot(itemName)
-          local t4 = nil
-          if not s4 then t4 = findBackpackTool(itemName) end
-          if not s4 and not t4 then return true, saw end
-          local left4 = s4 and (c4 or 1) or 1
-          if s4 and left4 < count then noProgress = 0
-          else noProgress = noProgress + 1 end
-        end
+      end
+      local t3 = findHeldTool(itemName)
+      local s3, c3 = nil, nil
+      if not t3 then s3, c3 = findItemSlot(itemName) end
+      if not t3 and not s3 then return true, saw end
+      local progressed2 = (not isTool) and s3 and (c3 or 1) < count
+      if progressed2 then
+        noProgress = 0
       else
-        tryDropRemote(s2 or t2, itemName)
+        tryDropRemote(t3 or s3, itemName)
         task.wait(0.5)
-        local s5, c5 = findItemSlot(itemName)
-        local t5 = nil
-        if not s5 then t5 = findBackpackTool(itemName) end
-        if not s5 and not t5 then return true, saw end
-        local left5 = s5 and (c5 or 1) or 1
-        if s5 and left5 < count then noProgress = 0
+        if isTool then
+          -- last resort: Backspace drops the equipped tool in default backpacks
+          pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            if vim and vim.SendKeyEvent then
+              vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
+              task.wait(0.1)
+              vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
+            end
+          end)
+          task.wait(0.3)
+        end
+        if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
+        local t4 = findHeldTool(itemName)
+        local s4, c4 = nil, nil
+        if not t4 then s4, c4 = findItemSlot(itemName) end
+        if not t4 and not s4 then return true, saw end
+        local progressed3 = (not isTool) and s4 and (c4 or 1) < count
+        if progressed3 then noProgress = 0
         else noProgress = noProgress + 1 end
       end
     end
@@ -1002,6 +1116,8 @@ local function dropAllPriority(myToken)
   if cancelled(myToken) then setStatus("Status: stopped") return 0, false end
   freezeAtDropSpot()
   openInventory()
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  fetchInventoryData()
   if cancelled(myToken) then setStatus("Status: stopped") return 0 end
   local emptied = 0
   local sawAny = false
@@ -1048,12 +1164,22 @@ local function scanGameGui()
     local pack = LP and LP.FindFirstChild and LP:FindFirstChild("Backpack")
     if pack then
       local kids = pack:GetChildren()
-      say("Scan: backpack has " .. #kids .. " tools:")
+      say("Scan: backpack has " .. #kids .. " items:")
       for _, c in ipairs(kids) do
-        say("  " .. c.ClassName .. " '" .. tostring(c.Name) .. "'")
+        say("  backpack: " .. c.ClassName .. " '" .. tostring(c.Name) .. "'")
       end
     else
       say("Scan: no Backpack")
+    end
+  end)
+  pcall(function()
+    local char = LP and LP.Character
+    if char then
+      for _, c in ipairs(char:GetChildren()) do
+        if c.ClassName == "Tool" then
+          say("  equipped: Tool '" .. tostring(c.Name) .. "'")
+        end
+      end
     end
   end)
   pcall(function()
@@ -1544,12 +1670,16 @@ if FALLBACK then
     demoPg.Name = "PlayerGui"
     LP.PlayerGui = demoPg
     local inv = Instance.new("ScreenGui")
-    inv.Name = "Inventory"
-    inv.Enabled = false
+    inv.Name = "MainGui"
+    inv.Enabled = true
     inv.Parent = demoPg
+    local frame = Instance.new("Frame")
+    frame.Name = "InventoryFrame"
+    frame.Visible = false
+    frame.Parent = inv
     local list = Instance.new("Frame")
     list.Name = "ItemList"
-    list.Parent = inv
+    list.Parent = frame
     local function demoItem(name, n)
       local b = Instance.new("TextButton")
       b.Name = name
@@ -1577,7 +1707,28 @@ if FALLBACK then
     local drop = Instance.new("TextButton")
     drop.Name = "Drop"
     drop.Text = "Drop"
-    drop.Parent = inv
+    drop.Parent = frame
+    local demoPack = Instance.new("Folder")
+    demoPack.Name = "Backpack"
+    LP.Backpack = demoPack
+    local demoTool = Instance.new("Tool")
+    demoTool.Name = "Shiny Arrow"
+    demoTool.Parent = demoPack
+    drop.Activate = function(self)
+      pcall(function()
+        for _, cont in ipairs({demoPack, LP.Character}) do
+          if cont then
+            for _, c in ipairs(cont:GetChildren()) do
+              if c.Name == "Shiny Arrow" or c.Name == "Legendary Arrow"
+                or c.Name == "Stand Arrow" or c.Name == "Locacaca Fruit" then
+                c.Parent = nil
+                return
+              end
+            end
+          end
+        end
+      end)
+    end
   end)
   print("Demo: dropping arrows/fruit like Drop All does (frozen at 298, 17, 207).")
   holdDropSpot()
