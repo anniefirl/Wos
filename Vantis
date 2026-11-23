@@ -29,6 +29,7 @@ local warnedNoRemote = false
 local sweepToken = 0
 local manualRunning = false
 local dropRunning = false
+local dropToggle -- assigned in the Drops tab; the real Auto Drop switch
 
 -- any sweep carrying an old token must stop at its next checkpoint.
 -- nil token = no cancellation (demo / one-off calls).
@@ -1437,7 +1438,13 @@ local autoToggle = FarmTab:AddToggle({
   Callback = function(state)
     Flags.Auto = state
     sweepToken = sweepToken + 1 -- abort any in-progress sweep so OFF stops immediately
-    if not state then manualRunning = false dropRunning = false unfreezeNow() end
+    if state then
+      -- farming takes over: halt any drop loop and show its switch as off
+      dropRunning = false
+      pcall(function() if dropToggle then dropToggle:Set(false) end end)
+    else
+      manualRunning = false dropRunning = false unfreezeNow()
+    end
     say("Auto Collect " .. (state and "enabled" or "disabled"))
     Window:Notify({ Title = "Auto Collect", Text = state and "Enabled" or "Disabled", Duration = 2 })
     setStatus(state and "Status: auto on (1->54)" or "Status: stopped")
@@ -1572,6 +1579,7 @@ FarmTab:AddButton({
     sweepToken = sweepToken + 1
     manualRunning = false
     dropRunning = false
+    pcall(function() if dropToggle then dropToggle:Set(false) end end)
     unfreezeNow()
     setStatus("Status: stopped")
     say("Stopped")
@@ -1636,42 +1644,44 @@ DropsTab:AddButton({
   end,
 })
 
-DropsTab:AddButton({
-  Title    = "Drop All",
-  Subtitle = "Toggle: loops Legendary -> Shiny -> Stand -> Locacaca until stopped",
+dropToggle = DropsTab:AddToggle({
+  Title    = "Auto Drop",
+  Subtitle = "Loops Legendary -> Shiny -> Stand -> Locacaca until toggled off",
   Icon     = "package",
-  Text     = "Drop All",
-  Callback = function()
-    if dropRunning then
+  Default  = false,
+  Callback = function(state)
+    if state then
+      if dropRunning then return end
+      Flags.Auto = false
+      pcall(function() autoToggle:Set(false) end)
+      sweepToken = sweepToken + 1 -- pause farming so the player holds the drop spot
+      local myToken = sweepToken
+      dropRunning = true
+      setStatus("Status: drop ON - looping until stopped")
+      say("Drop All ON: Legendary -> Shiny -> Stand -> Locacaca, looping until stopped (frozen at 298, 17, 207)")
+      task.spawn(function()
+        local warned = false
+        while not cancelled(myToken) do
+          local emptied, sawAny = dropAllPriority(myToken)
+          if cancelled(myToken) then break end
+          if not sawAny and not warned then
+            warned = true
+            setStatus("Status: drop sees no inventory/items - run Scan GUI")
+            say("Drop All sees no inventory or items - press Scan GUI and share the log")
+          end
+          task.wait(0.5)
+        end
+        unfreezeNow()
+        if myToken == sweepToken then dropRunning = false end
+      end)
+    else
+      if not dropRunning then return end
       sweepToken = sweepToken + 1
       dropRunning = false
       unfreezeNow()
       setStatus("Status: stopped")
       say("Drop stopped")
-      return
     end
-    Flags.Auto = false
-    pcall(function() autoToggle:Set(false) end)
-    sweepToken = sweepToken + 1 -- pause farming so the player holds the drop spot
-    local myToken = sweepToken
-    dropRunning = true
-    setStatus("Status: drop ON - looping until stopped")
-    say("Drop All ON: Legendary -> Shiny -> Stand -> Locacaca, looping until stopped (frozen at 298, 17, 207)")
-    task.spawn(function()
-      local warned = false
-      while not cancelled(myToken) do
-        local emptied, sawAny = dropAllPriority(myToken)
-        if cancelled(myToken) then break end
-        if not sawAny and not warned then
-          warned = true
-          setStatus("Status: drop sees no inventory/items - run Scan GUI")
-          say("Drop All sees no inventory or items - press Scan GUI and share the log")
-        end
-        task.wait(0.5)
-      end
-      unfreezeNow()
-      if myToken == sweepToken then dropRunning = false end
-    end)
   end,
 })
 
