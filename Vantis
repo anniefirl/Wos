@@ -479,6 +479,71 @@ local function collectOrdered(myToken)
   return done
 end
 
+-- INSTANT BURST: teleport + fire every chest back-to-back with no per-chest
+-- verification waits, then ONE short wait and a single verify pass. As close
+-- to "all at once" as a distance-checking server allows: movement is still
+-- instant CFrame teleports (so proximity checks pass), with a small 0.15s
+-- beat per chest so it reads as fast movement rather than a same-frame
+-- vacuum (which is what anti-cheat flags). ~10s for all 54.
+local function collectInstant(myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  ensureCache()
+  local targets = {}
+  local skipped = 0
+  for num = Flags.From, Flags.To do
+    if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+    local e = cache[num]
+    if not e or e.model.Parent == nil or not e.prompt or e.prompt.Parent == nil then
+      e = findChestByNum(num)
+    end
+    if e and e.part and e.part.Position and not isOpened(e) then
+      targets[#targets + 1] = e
+    elseif not e then
+      skipped = skipped + 1
+    end
+  end
+  if #targets == 0 then
+    setStatus("Status: burst done - nothing closed to open" .. (skipped > 0 and " (" .. skipped .. " not found)" or ""))
+    say("Instant burst: nothing to open")
+    return 0
+  end
+  setStatus("Status: burst - firing " .. #targets .. " chests...")
+  say("Instant burst: firing " .. #targets .. " chests back-to-back")
+  for _, e in ipairs(targets) do
+    if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+    local hrp = getHRP()
+    if hrp then
+      pcall(function()
+        hrp.CFrame = CFrame.new(e.part.Position.X, e.part.Position.Y + 3, e.part.Position.Z)
+      end)
+    end
+    holdPrompt(e.prompt)
+    tryRemoteFallback(e.model, e.num, 1)
+    task.wait(0.15)
+  end
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  task.wait(1.5)
+  local opened = 0
+  for _, e in ipairs(targets) do
+    if cancelled(myToken) then setStatus("Status: stopped") return opened end
+    if isOpened(e) then
+      if not openedSet[e.num] then openedSet[e.num] = true uniqueOpened = uniqueOpened + 1 end
+      totalOpens = totalOpens + 1
+      opened = opened + 1
+    end
+  end
+  Flags.Collected = totalOpens
+  refreshCounter()
+  local left = #targets - opened
+  if left == 0 then
+    setStatus("Status: burst done - all " .. opened .. " opened!" .. (skipped > 0 and " (" .. skipped .. " not found)" or ""))
+  else
+    setStatus("Status: burst done - " .. opened .. "/" .. #targets .. " opened, " .. left .. " need the normal sweep")
+  end
+  say("Instant burst: " .. opened .. "/" .. #targets .. " opened")
+  return opened
+end
+
 -- legacy nearest-first single pass (kept for the old button).
 local function collectNearestOnce(myToken)
   if cancelled(myToken) then setStatus("Status: stopped") return 0 end
@@ -1178,10 +1243,10 @@ local function dropOneOf(itemName, myToken)
         end
         if hum and hum.EquipTool then hum:EquipTool(slot) end
       end)
-      task.wait(0.35)
+      task.wait(0.15)
     else
       clickGui(slot)
-      task.wait(0.4)
+      task.wait(0.2)
     end
     if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
     -- recount tools first: gone from hands AND pack means actually dropped
@@ -1197,24 +1262,25 @@ local function dropOneOf(itemName, myToken)
     else
       -- old slow path that worked: leftover confirmation first, then Drop
       -- + a patient poll for the popup, then remote + Backspace every try.
+      -- (same steps, tighter waits for speed)
       -- 1. leftover confirmation from the last attempt? press it, don't re-drop
       local preConfirm = findConfirmButton(nil)
       if preConfirm then
         clickGui(preConfirm)
         say("Conform pressed for " .. itemName)
-        task.wait(0.6)
+        task.wait(0.3)
       else
         -- 2. Drop button, then POLL for the confirmation (it can pop in late)
         local dropBtn = findDropButton()
         if dropBtn then
           clickGui(dropBtn)
-          task.wait(0.4)
+          task.wait(0.2)
           local confirmBtn = nil
           for i = 1, 25 do
             if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
             confirmBtn = findConfirmButton(dropBtn)
             if confirmBtn then break end
-            task.wait(0.15)
+            task.wait(0.1)
           end
           if confirmBtn then
             clickGui(confirmBtn)
@@ -1222,7 +1288,7 @@ local function dropOneOf(itemName, myToken)
           else
             say("Drop: no Conform popup appeared for " .. itemName .. " (press Scan GUI if this repeats)")
           end
-          task.wait(0.5)
+          task.wait(0.25)
         else
           say("Drop: no Drop button found for " .. itemName .. " - trying remote/Backspace")
         end
@@ -1237,18 +1303,18 @@ local function dropOneOf(itemName, myToken)
         noProgress = 0
       else
         tryDropRemote(t3 or s3, itemName)
-        task.wait(0.5)
+        task.wait(0.25)
         if isTool then
           -- last resort: Backspace drops the equipped tool in default backpacks
           pcall(function()
             local vim = game:GetService("VirtualInputManager")
             if vim and vim.SendKeyEvent then
               vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
-              task.wait(0.2)
+              task.wait(0.1)
               vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
             end
           end)
-          task.wait(0.4)
+          task.wait(0.2)
         end
         if cancelled(myToken) then setStatus("Status: stopped") return false, saw end
         local t4 = findHeldTool(itemName)
@@ -1266,7 +1332,7 @@ local function dropOneOf(itemName, myToken)
       say("Could not drop " .. itemName .. " - leaving it and moving on")
       return false, saw
     end
-    task.wait(0.1)
+    task.wait(0.05)
   end
   setStatus("Status: drop [" .. itemName .. "] gave up after 30 tries")
   return false, saw
@@ -1305,7 +1371,7 @@ local function dropAllPriority(myToken)
     if saw then sawAny = true end
     if ok then emptied = emptied + 1 end
     if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-    task.wait(0.1)
+    task.wait(0.05)
   end
   if cancelled(myToken) then setStatus("Status: stopped") return emptied, sawAny end
   setStatus("Status: drop done - arrows/fruit at 0")
@@ -1682,6 +1748,30 @@ FarmTab:AddButton({
 })
 
 FarmTab:AddButton({
+  Title    = "Instant Burst",
+  Subtitle = "Fires every chest back-to-back, verifies once (~10s for 54)",
+  Icon     = "zap",
+  Text     = "Burst",
+  Callback = function()
+    Flags.Auto = false
+    pcall(function() autoToggle:Set(false) end)
+    sweepToken = sweepToken + 1
+    local myToken = sweepToken
+    manualRunning = true
+    say("Instant burst started: " .. Flags.From .. " -> " .. Flags.To)
+    task.spawn(function()
+      local n = collectInstant(myToken)
+      if myToken == sweepToken then manualRunning = false end
+      if cancelled(myToken) then
+        say("Burst stopped")
+      else
+        Window:Notify({ Title = "Done", Text = "Burst: " .. n .. " opened", Duration = 3 })
+      end
+    end)
+  end,
+})
+
+FarmTab:AddButton({
   Title    = "Collect Nearest",
   Subtitle = "One chest, closest first (legacy)",
   Icon     = "mouse-pointer",
@@ -1814,7 +1904,7 @@ dropToggle = DropsTab:AddToggle({
               setStatus("Status: drop sees no inventory/items - run Scan GUI")
               say("Drop All sees no inventory or items - press Scan GUI and share the log")
             end
-            task.wait(0.5)
+            task.wait(0.25)
           end
         end
         unfreezeNow()
@@ -2001,7 +2091,7 @@ if FALLBACK then
 end
 
 -- handle for driving / testing the collector
-ChestCollector = { Flags = Flags, collectOneNum = collectOneNum, collectOrdered = collectOrdered, collectNearestOnce = collectNearestOnce, findChestByNum = findChestByNum, getHRP = getHRP, openInventory = openInventory, dropAll = dropAllPriority,
+ChestCollector = { Flags = Flags, collectOneNum = collectOneNum, collectOrdered = collectOrdered, collectInstant = collectInstant, collectNearestOnce = collectNearestOnce, findChestByNum = findChestByNum, getHRP = getHRP, openInventory = openInventory, dropAll = dropAllPriority,
   stop = function()
     Flags.Auto = false
     pcall(function() autoToggle:Set(false) end)
