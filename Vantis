@@ -612,14 +612,58 @@ local function openInventory()
   return true
 end
 
--- Drop spot: while auto drop runs, the player is frozen here, looking downwards.
+-- Drop spot: while auto drop runs, the player is frozen here, standing upright.
+-- (Pitching the root part lays the whole rig flat, which left the character
+-- positioned wrong - so the character stands and the camera looks down instead.)
 local DropSpotX, DropSpotY, DropSpotZ = 298, 17, 207
 
+local function zeroMotion(hrp)
+  pcall(function()
+    hrp.Velocity = Vector3.zero
+    hrp.RotVelocity = Vector3.zero
+  end)
+  pcall(function()
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+  end)
+end
+
+local function dropSpotCFrame()
+  return CFrame.new(DropSpotX, DropSpotY, DropSpotZ)
+end
+
+-- full freeze: unanchor FIRST (a CFrame set on an already-anchored part does
+-- not always replicate, so the server snaps the character back), kill all
+-- velocity, double-set the standing CFrame, then anchor. camera looks down
+-- at the drop pile.
+local function freezeAtDropSpot()
+  local hrp = getHRP()
+  if not hrp then return nil end
+  pcall(function() hrp.Anchored = false end)
+  zeroMotion(hrp)
+  pcall(function() hrp.CFrame = dropSpotCFrame() end)
+  task.wait(0.15)
+  pcall(function() hrp.CFrame = dropSpotCFrame() end)
+  zeroMotion(hrp)
+  pcall(function() hrp.Anchored = true end)
+  pcall(function()
+    local cam = workspace.CurrentCamera
+    if cam then
+      cam.CFrame = CFrame.new(
+        Vector3.new(DropSpotX, DropSpotY + 14, DropSpotZ + 4),
+        Vector3.new(DropSpotX, DropSpotY, DropSpotZ))
+    end
+  end)
+  return hrp
+end
+
+-- light maintenance between drops: re-pin + re-anchor + zero motion, no waits
 local function holdDropSpot()
   pcall(function()
     local hrp = getHRP()
     if hrp then
-      hrp.CFrame = CFrame.new(DropSpotX, DropSpotY, DropSpotZ) * CFrame.Angles(-math.pi / 2, 0, 0)
+      zeroMotion(hrp)
+      hrp.CFrame = dropSpotCFrame()
       hrp.Anchored = true
     end
   end)
@@ -938,7 +982,7 @@ end
 -- priority order: legendary -> shiny -> stand -> locacaca, each until 0.
 local function dropAllPriority(myToken)
   if cancelled(myToken) then setStatus("Status: stopped") return 0 end
-  holdDropSpot()
+  freezeAtDropSpot()
   openInventory()
   if cancelled(myToken) then setStatus("Status: stopped") return 0 end
   local emptied = 0
