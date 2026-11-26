@@ -23,12 +23,12 @@ local NPC_LIST = {"Slugger", "Criminal", "Corrupt Cop", "Capo", "Mobster",
 local npcTarget = "All"
 
 -- farm skill selection (multi-select, all on by default).
--- RightClick = mouse1 click, E = hold 3s, R/G/C/X/V = taps.
-local SKILL_LIST = {"RightClick", "E", "R", "G", "C", "X", "V"}
+-- M1 = left mouse click, E = hold 3s, R/G/C/X/V = taps.
+local SKILL_LIST = {"M1", "E", "R", "G", "C", "X", "V"}
 
 local Flags = { Drop = false, NpcFarm = false,
   DropsLoaded = false, NpcHeight = 5,
-  Skills = { RightClick = true, E = true, R = true,
+  Skills = { M1 = true, E = true, R = true,
     G = true, C = true, X = true, V = true } }
 
 -- created by the UI below, callbacks only use them later
@@ -137,9 +137,61 @@ local function getPlayerHRP()
   return hrp
 end
 
+local function getHumanoid()
+  local char = nil
+  pcall(function() if LP then char = LP.Character end end)
+  if char == nil then return nil end
+  local hum = nil
+  pcall(function()
+    if char.FindFirstChildOfClass then hum = char:FindFirstChildOfClass("Humanoid") end
+  end)
+  if hum == nil then
+    pcall(function() hum = char:FindFirstChild("Humanoid") end)
+  end
+  return hum
+end
+
+-- pin the character mid-air. anchoring the HRP is what stops the fall
+-- between teleports; velocities are zeroed so there is no drift.
+-- never throws. call with false to hand physics back (Land button,
+-- farm toggle off). the loop re-anchors on every teleport, so a
+-- respawned character gets pinned again on the next pass.
+local function setFloat(on)
+  local hrp = getPlayerHRP()
+  if hrp then
+    pcall(function() hrp.Anchored = on end)
+    pcall(function() hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+    pcall(function() hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0) end)
+    pcall(function() hrp.Velocity = Vector3.new(0, 0, 0) end)
+    pcall(function() hrp.RotVelocity = Vector3.new(0, 0, 0) end)
+  end
+  local hum = getHumanoid()
+  if hum then
+    pcall(function() hum.PlatformStand = on end)
+  end
+end
+
+-- one-shot input status line so a real executor tells the truth: if the
+-- executor blocks VirtualInputManager, key/mouse presses can never land
+-- and the log says so instead of silently doing nothing.
+local inputReported = false
+local function reportInput(vim)
+  if inputReported then return end
+  inputReported = true
+  if vim then
+    say("Input: VirtualInputManager ready")
+  else
+    say("Input: no VirtualInputManager (mock has no input - in game this means the executor blocked it)")
+  end
+  pcall(function()
+    if mouse1click then say("Input: mouse1click fallback available") end
+  end)
+end
+
 -- skill rotation after each teleport. only fires skills enabled in
--- Flags.Skills (Farm tab multi-select). right click, E held 3s, R G C X V.
--- real executor fires them through VirtualInputManager; the editor mock
+-- Flags.Skills (Farm tab multi-select). M1 left click, E held 3s,
+-- R G C X V taps. fires through VirtualInputManager with mouse1click /
+-- keypress fallbacks where the executor exposes them; the editor mock
 -- has no input service, so it just logs the rotation. never throws.
 local function useSkills()
   local skills = Flags.Skills
@@ -153,21 +205,53 @@ local function useSkills()
   end
   local vim = nil
   pcall(function() vim = game:GetService("VirtualInputManager") end)
+  reportInput(vim)
+  local function clickM1()
+    if vim then
+      local ok = pcall(function()
+        vim:SendMouseButtonEvent(500, 500, 0, true, game, 0)
+        task.wait(0.1)
+        vim:SendMouseButtonEvent(500, 500, 0, false, game, 0)
+      end)
+      if ok then return end
+    end
+    pcall(function()
+      if mouse1click then
+        mouse1click()
+      elseif mouse1press and mouse1release then
+        mouse1press()
+        task.wait(0.1)
+        mouse1release()
+      end
+    end)
+  end
   local function keyDown(code)
-    if vim then pcall(function() vim:SendKeyEvent(true, code, false, game) end) end
+    if vim then
+      local ok = pcall(function() vim:SendKeyEvent(true, code, false, game) end)
+      if ok then return true end
+    end
+    local keyVal = code
+    pcall(function() if code.Value ~= nil then keyVal = code.Value end end)
+    local pressed = false
+    pcall(function()
+      if keypress then keypress(keyVal) pressed = true end
+    end)
+    return pressed
   end
   local function keyUp(code)
-    if vim then pcall(function() vim:SendKeyEvent(false, code, false, game) end) end
-  end
-  if skills.RightClick then
     if vim then
-      pcall(function()
-        vim:SendMouseButtonEvent(500, 500, 1, true, game, 0)
-        task.wait(0.1)
-        vim:SendMouseButtonEvent(500, 500, 1, false, game, 0)
-      end)
+      pcall(function() vim:SendKeyEvent(false, code, false, game) end)
+      return
     end
-    say("Skill: right click")
+    local keyVal = code
+    pcall(function() if code.Value ~= nil then keyVal = code.Value end end)
+    pcall(function()
+      if keyrelease then keyrelease(keyVal) end
+    end)
+  end
+  if skills.M1 then
+    clickM1()
+    say("Skill: M1 click")
   end
   if skills.E then
     keyDown(Enum.KeyCode.E)
@@ -212,15 +296,18 @@ local function farmNpcsOnce()
     else
       local rp = rootPartOf(npc)
       if rp and rp.Position then
-        -- hover above the NPC, pitched 90 degrees so the player looks
-        -- straight down. stand skills fire downward into the NPC.
+        -- hover above the NPC, pinned + pitched 90 degrees so the player
+        -- looks straight down. anchored = no falling between teleports;
+        -- stand skills fire downward into the NPC.
         pcall(function()
           hrp.CFrame = CFrame.new(rp.Position.X, rp.Position.Y + Flags.NpcHeight, rp.Position.Z)
             * CFrame.Angles(math.rad(-90), 0, 0)
         end)
+        setFloat(true)
+        task.wait(0.25)
         visited = visited + 1
         setStatus("Status: above " .. name .. " (" .. visited .. ")")
-        say("Hovering above " .. name .. " (looking down 90 deg)")
+        say("Hovering above " .. name .. " (pinned, looking down 90 deg)")
         useSkills()
         task.wait(0.5)
       end
@@ -353,6 +440,9 @@ FarmTab:AddToggle({
   Default  = false,
   Callback = function(state)
     Flags.NpcFarm = state
+    if not state then
+      setFloat(false)
+    end
     say("NPC farm " .. (state and "enabled" or "disabled"))
     setStatus(state and "Status: npc farm on" or "Status: stopped")
   end,
@@ -400,8 +490,21 @@ FarmTab:AddButton({
   Callback = function()
     task.spawn(function()
       local n = farmNpcsOnce()
-      say("NPC pass: " .. n .. " visited")
+      say("NPC pass: " .. n .. " visited (still floating - Land to drop)")
     end)
+  end,
+})
+
+FarmTab:AddButton({
+  Title    = "Land",
+  Subtitle = "Unpin and drop back to normal physics",
+  Icon     = "arrow-down",
+  Text     = "Land",
+  Callback = function()
+    Flags.NpcFarm = false
+    setFloat(false)
+    say("Landed - physics back to normal")
+    setStatus("Status: stopped")
   end,
 })
 
@@ -410,7 +513,7 @@ FarmTab:AddLabel("Skills (multi-select): only checked skills fire", "zap")
 
 local skillToggles = {}
 local skillDefs = {
-  { Key = "RightClick", Title = "Skill: Right Click", Subtitle = "Mouse1 click" },
+  { Key = "M1", Title = "Skill: M1 (left click)", Subtitle = "Left mouse click" },
   { Key = "E", Title = "Skill: E (hold 3s)", Subtitle = "Hold, then release" },
   { Key = "R", Title = "Skill: R", Subtitle = "Tap" },
   { Key = "G", Title = "Skill: G", Subtitle = "Tap" },
@@ -464,7 +567,7 @@ FarmTab:AddButton({
   end,
 })
 
-FarmTab:AddLabel("Aim: hover + pitch 90 deg, looking straight down so stand skills hit", "crosshair")
+FarmTab:AddLabel("Aim: pinned hover + pitch 90 deg, looking straight down so stand skills hit", "crosshair")
 
 -- chest tab config (used only by the Chests tab below)
 Flags.Auto = false
