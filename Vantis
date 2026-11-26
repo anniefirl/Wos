@@ -12,6 +12,15 @@ local MODULE_URLS = {
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
+local TweenService = nil
+pcall(function() TweenService = game:GetService("TweenService") end)
+local activeTween = nil
+
+-- Infinite-Yield-style movement support: the noclip loop ticks on
+-- Stepped so respawned characters and newly added parts stay covered.
+local RunService = nil
+pcall(function() RunService = game:GetService("RunService") end)
+
 -- NPC farm targets: exact in-game names, ordered weakest -> strongest
 -- (London 1-12 -> NY/Sewers 12-28 -> Hamon domain -> Desert 30+).
 -- Matching is case-insensitive; Esidisi also matches Eisidisi/sidisi,
@@ -71,7 +80,7 @@ local floatPos = "Above" -- "Above" | "Behind" | "Below"
 local SKILL_LIST = {"M1", "M2", "E", "R", "G", "C", "X", "V"}
 
 local Flags = { Drop = false, NpcFarm = false, Combo = false, NoV = false,
-  DropsLoaded = false, NpcHeight = 5,
+  DropsLoaded = false, NpcHeight = 5, FarmMethod = "Instant",
   Skills = { M1 = true, M2 = true, E = true, R = true,
     G = true, C = true, X = true, V = true } }
 
@@ -131,6 +140,11 @@ local function rootPartOf(model)
   if model == nil then return nil end
   local rp = nil
   pcall(function() rp = model:FindFirstChild("HumanoidRootPart") end)
+  if rp then return rp end
+  -- R6 / fallback rigs (Infinite-Yield getRoot chain)
+  pcall(function() rp = model:FindFirstChild("UpperTorso") end)
+  if rp then return rp end
+  pcall(function() rp = model:FindFirstChild("Torso") end)
   if rp then return rp end
   pcall(function()
     for _, d in ipairs(model:GetDescendants()) do
@@ -194,6 +208,11 @@ local function getPlayerHRP()
   if char == nil then return nil end
   local hrp = nil
   pcall(function() hrp = char:FindFirstChild("HumanoidRootPart") end)
+  if hrp then return hrp end
+  -- R6 / fallback rigs (Infinite-Yield getRoot chain)
+  pcall(function() hrp = char:FindFirstChild("UpperTorso") end)
+  if hrp then return hrp end
+  pcall(function() hrp = char:FindFirstChild("Torso") end)
   return hrp
 end
 
@@ -217,6 +236,10 @@ end
 -- farm toggle off). the loop re-anchors on every teleport, so a
 -- respawned character gets pinned again on the next pass.
 local function setFloat(on)
+  if not on then
+    pcall(function() if activeTween ~= nil then activeTween:Cancel() end end)
+    activeTween = nil
+  end
   local hrp = getPlayerHRP()
   if hrp then
     pcall(function() hrp.Anchored = on end)
@@ -267,14 +290,156 @@ local function hoverPose(rp)
     * CFrame.Angles(math.rad(-90), 0, 0)
 end
 
--- teleports the player to the current float pose + pins. returns false
--- when there is nothing to pin to. never throws.
+-- noclip while farming so glides/teleports never snag on walls.
+-- Infinite-Yield-style: a Stepped loop keeps every part non-collidable
+-- (respawned characters and newly added parts included), not just a
+-- one-shot pass. Land / toggle-off disconnects and restores collisions.
+-- never throws.
+local noclipOn = false
+local noclipConn = nil
+
+local function isNoclipPart(d)
+  local ok, res = pcall(function() return d:IsA("BasePart") end)
+  if ok and res then return true end
+  local cn = nil
+  pcall(function() cn = d.ClassName end)
+  return cn == "Part" or cn == "MeshPart"
+end
+
+local function noclipTick()
+  if not noclipOn then return end
+  local char = nil
+  pcall(function() if LP then char = LP.Character end end)
+  if char == nil then return end
+  pcall(function()
+    for _, d in ipairs(char:GetDescendants()) do
+      if isNoclipPart(d) then
+        pcall(function() d.CanCollide = false end)
+      end
+    end
+  end)
+end
+
+local function setNoclip(on)
+  noclipOn = on
+  pcall(function()
+    if noclipConn ~= nil then noclipConn:Disconnect() end
+  end)
+  noclipConn = nil
+  if on then
+    noclipTick()
+    pcall(function()
+      if RunService ~= nil then
+        local sig = RunService.Stepped or RunService.Heartbeat
+        if sig ~= nil then noclipConn = sig:Connect(noclipTick) end
+      end
+    end)
+  else
+    local char = nil
+    pcall(function() if LP then char = LP.Character end end)
+    if char ~= nil then
+      pcall(function()
+        for _, d in ipairs(char:GetDescendants()) do
+          if isNoclipPart(d) then
+            pcall(function() d.CanCollide = true end)
+          end
+        end
+      end)
+    end
+  end
+end
+
+-- Infinite-Yield anti-afk pattern: idle kicks end long farms, so the
+-- farm toggle disables the LocalPlayer Idled connections once per
+-- session. executor-only (needs getconnections); logs plainly when the
+-- executor lacks it. never throws.
+local antiAfkDone = false
+local function ensureAntiAfk()
+  if antiAfkDone then return end
+  antiAfkDone = true
+  local done = false
+  pcall(function()
+    local GC = getconnections or get_signal_cons
+    if GC ~= nil and LP ~= nil and LP.Idled ~= nil then
+      local cons = GC(LP.Idled)
+      if cons ~= nil then
+        for _, c in ipairs(cons) do
+          pcall(function()
+            if c.Disable ~= nil then c:Disable()
+            elseif c.Disconnect ~= nil then c:Disconnect() end
+          end)
+        end
+        done = true
+      end
+    end
+  end)
+  if done then say("Anti-AFK on (idle kick blocked)")
+  else say("Anti-AFK unavailable here (needs getconnections)") end
+end
+
+-- teleports the player to the current float pose + pins. Instant snaps,
+-- Glide flies there (~150 studs/s) so servers that reject teleports
+-- (rubber-band: you look stuck while the log says otherwise) still
+-- accept the move. verifies arrival - unanchored drifting or a server
+-- pull-back reads as false. never throws.
 local function pinTo(rp)
   local hrp = getPlayerHRP()
   if hrp == nil or rp == nil or rp.Position == nil then return false end
-  pcall(function() hrp.CFrame = hoverPose(rp) end)
+  -- Infinite-Yield goto pattern: stand up first, or a seat weld keeps
+  -- dragging the character back to the chair after the teleport.
+  local wasSeated = false
+  pcall(function()
+    local hum = getHumanoid()
+    if hum ~= nil and hum.SeatPart ~= nil then
+      hum.Sit = false
+      wasSeated = true
+    end
+  end)
+  if wasSeated then pcall(function() task.wait(0.1) end) end
+  local cf = hoverPose(rp)
+  if Flags.FarmMethod == "Glide" then
+    setFloat(false)
+    local glided = false
+    pcall(function()
+      if TweenService ~= nil and TweenService.Create ~= nil then
+        local dist = 0
+        pcall(function() dist = (cf.Position - hrp.CFrame.Position).Magnitude end)
+        local t = math.max(dist / 150, 0.1)
+        activeTween = TweenService:Create(hrp, TweenInfo.new(t, Enum.EasingStyle.Linear), {CFrame = cf})
+        activeTween:Play()
+        task.wait(t + 0.1)
+        activeTween = nil
+        glided = true
+      end
+    end)
+    if not glided then
+      pcall(function() hrp.CFrame = cf end)
+    end
+  else
+    pcall(function() hrp.CFrame = cf end)
+  end
   setFloat(true)
-  return true
+  task.wait(0.2)
+  local d = nil
+  pcall(function()
+    if hrp.Position ~= nil then d = (hrp.Position - cf.Position).Magnitude end
+  end)
+  return d ~= nil and d <= 8
+end
+
+-- pin with one automatic glide retry when the server rejects the
+-- position. returns arrival. never throws.
+local function pinVerified(rp, name)
+  if pinTo(rp) then return true end
+  say("Position rejected (" .. name .. ") - retrying as glide...")
+  local old = Flags.FarmMethod
+  Flags.FarmMethod = "Glide"
+  local ok = pinTo(rp)
+  Flags.FarmMethod = old
+  if not ok then
+    say("Still stuck at " .. name .. " - Land, move manually, or set Move Method to Glide")
+  end
+  return ok
 end
 
 -- mobile-to-PC skill map (from the phone HUD: Punch / Secondary buttons
@@ -753,6 +918,11 @@ local function followTarget(name)
   local myToken = followToken
   say("Locked onto " .. name .. " - following + skill spam (toggle off or Land to stop)")
   setStatus("Status: locked " .. name)
+  setNoclip(true)
+  if npc ~= nil then
+    local rp0 = rootPartOf(npc)
+    if rp0 ~= nil then pinVerified(rp0, name) end
+  end
   keepPin(name, myToken, function()
     if npc == nil then return nil end
     return rootPartOf(npc)
@@ -790,6 +960,7 @@ local function visitOnce(name)
     say("NPC farm: no character yet")
     return 0
   end
+  setNoclip(true)
   local npc = findNpcByName(name)
   if npc == nil then
     say("NPC farm: " .. name .. " not found, skipping")
@@ -804,7 +975,7 @@ local function visitOnce(name)
     say("NPC farm: " .. name .. " has no position, skipping")
     return 0
   end
-  pinTo(rp)
+  pinVerified(rp, name)
   task.wait(0.25)
   setStatus("Status: " .. modeLabel() .. " " .. name)
   say("Hovering " .. modeLabel() .. " " .. name .. " (pinned)")
@@ -845,14 +1016,17 @@ local function farmNpcsOnce()
       local rp = rootPartOf(npc)
       if rp and rp.Position then
         -- hover at the chosen float pose, pinned so there is no falling
-        -- between teleports.
-        pinTo(rp)
-        task.wait(0.25)
-        visited = visited + 1
-        setStatus("Status: " .. modeLabel() .. " " .. name .. " (" .. visited .. ")")
-        say("Hovering " .. modeLabel() .. " " .. name .. " (pinned)")
-        fireRotation()
-        task.wait(0.5)
+        -- between teleports. verified: a server pull-back retries as glide.
+        if pinVerified(rp, name) then
+          task.wait(0.25)
+          visited = visited + 1
+          setStatus("Status: " .. modeLabel() .. " " .. name .. " (" .. visited .. ")")
+          say("Hovering " .. modeLabel() .. " " .. name .. " (pinned)")
+          fireRotation()
+          task.wait(0.5)
+        else
+          task.wait(0.5)
+        end
       end
     end
   end
@@ -866,6 +1040,524 @@ local function farmNpcsOnce()
   end
   say("NPCs: " .. visited)
   return visited
+end
+
+-- Chest collecting core (ported from the chest-collector module):
+-- strict numeric order From -> To, prompt-first (fireproximityprompt, so
+-- the game's own server script runs - no remote name guessing), remote
+-- fallback, streaming memory, max 3 tries per chest. never throws.
+local sweepToken = 0
+
+-- any sweep carrying an old token must stop at its next checkpoint.
+-- nil token = no cancellation (demo / one-off calls).
+local function cancelled(myToken)
+  return myToken ~= nil and myToken ~= sweepToken
+end
+
+local memory = {}      -- [num] = last seen position (for unstreamed chests)
+local lastSeen = {}    -- nums present in the latest scan
+local openedSet = {}   -- nums opened at least once
+local uniqueOpened = 0
+local totalOpens = 0
+local warnedNoRemote = false
+local openRemote = nil
+local openRemoteCheckedAt = 0
+
+local function updateChestCount()
+  local range = math.max(1, Flags.To - Flags.From + 1)
+  local msg = "Opened: " .. uniqueOpened .. " / " .. range .. " (" .. totalOpens .. " total)"
+  if chestCount then pcall(function() chestCount:Set(msg) end) end
+  print(msg)
+end
+
+-- player root for chest travel: Serene's farm-grade lookup (HRP ->
+-- UpperTorso -> Torso fallback chain). nil = no character yet.
+local function chestHRP()
+  return getPlayerHRP()
+end
+
+local function isCrateName(name)
+  if type(name) ~= "string" then return false end
+  return string.find(string.lower(name), "crate", 1, true) ~= nil
+end
+
+local function dist3(a, b)
+  local dx = a.X - b.X
+  local dy = a.Y - b.Y
+  local dz = a.Z - b.Z
+  return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+-- cache: [num] = { model=, prompt=, opened=, part= }
+local cache = {}
+local cacheReady = false
+
+local function firstOf(model, className)
+  for _, x in ipairs(model:GetDescendants()) do
+    if x.ClassName == className then return x end
+  end
+  return nil
+end
+
+local function modelOf(node)
+  local cur = node
+  for _ = 1, 4 do
+    if cur == nil then return nil end
+    if cur.ClassName == "Model" then
+      if isCrateName(cur.Name) then return nil end -- a prompt inside a Crate belongs to the crate: leave it alone
+      if tonumber(cur.Name) then return cur end
+    end
+    if cur.Name and tonumber(cur.Name) and cur.FindFirstChild then
+      local ok, has = pcall(function() return cur:FindFirstChild("Opened") end)
+      if ok and has then return cur end
+    end
+    cur = cur.Parent
+  end
+  return nil
+end
+
+local function entryFor(model)
+  if model == nil then return nil end
+  if isCrateName(model.Name) then return nil end -- crates are never chests
+  local num = tonumber(model.Name)
+  if not num then return nil end
+  local prompt = firstOf(model, "ProximityPrompt")
+  if not prompt then return nil end
+  local part = model:FindFirstChild("ChestPart", true) or firstOf(model, "Part")
+  if not part then part = prompt.Parent end
+  local opened = nil
+  pcall(function() opened = model:FindFirstChild("Opened") end)
+  return { model = model, num = num, prompt = prompt, part = part, opened = opened }
+end
+
+local function cacheAdd(model)
+  local e = entryFor(model)
+  if e then cache[e.num] = e end
+end
+
+local function buildCache()
+  cache = {}
+  local all = workspace:GetDescendants()
+  for _, d in ipairs(all) do
+    if d.ClassName == "ProximityPrompt" then
+      local m = modelOf(d)
+      if m then cacheAdd(m) end
+    end
+  end
+  -- also accept numeric models even if prompt search missed
+  for _, d in ipairs(all) do
+    if d.ClassName == "Model" and tonumber(d.Name) then
+      local n = tonumber(d.Name)
+      if cache[n] == nil then cacheAdd(d) end
+    end
+  end
+  local n = 0
+  for _ in pairs(cache) do n = n + 1 end
+  say("Chest cache: " .. n .. " chests tracked")
+end
+
+local function registerCacheHandlers()
+  if cacheReady then return end
+  cacheReady = true
+  workspace.DescendantAdded:Connect(function(d)
+    if d.ClassName == "ProximityPrompt" then
+      local m = modelOf(d)
+      if m then cacheAdd(m) end
+    elseif d.ClassName == "Model" and tonumber(d.Name) then
+      cacheAdd(d)
+    end
+  end)
+  workspace.DescendantRemoving:Connect(function(d)
+    if d.ClassName == "Model" and tonumber(d.Name) then
+      local n = tonumber(d.Name)
+      cache[n] = nil
+    end
+  end)
+end
+
+local function ensureCache()
+  if not cacheReady then buildCache() registerCacheHandlers() end
+end
+
+-- fresh lookup for ONE number: cache first, then a full scan (handles folders).
+local function findChestByNum(num)
+  ensureCache()
+  local e = cache[num]
+  if e and e.model.Parent ~= nil and e.prompt and e.prompt.Parent ~= nil then
+    if e.part and e.part.Position then
+      memory[num] = e.part.Position
+      lastSeen[num] = true
+      return e
+    end
+  end
+  -- single pass over the workspace (one GetDescendants, not two): prompt
+  -- matches win immediately, a bare numbered model is the fallback.
+  local plain = nil
+  for _, d in ipairs(workspace:GetDescendants()) do
+    if d.ClassName == "ProximityPrompt" then
+      local m = modelOf(d)
+      if m and tonumber(m.Name) == num then
+        cacheAdd(m)
+        local e2 = cache[num]
+        if e2 and e2.part and e2.part.Position then
+          memory[num] = e2.part.Position
+          lastSeen[num] = true
+          return e2
+        end
+        return e2
+      end
+    elseif plain == nil and d.ClassName == "Model" and tonumber(d.Name) == num then
+      plain = d
+    end
+  end
+  if plain ~= nil then
+    cacheAdd(plain)
+    local e2 = cache[num]
+    if e2 then
+      if e2.part and e2.part.Position then memory[num] = e2.part.Position end
+      lastSeen[num] = true
+      return e2
+    end
+    return entryFor(plain)
+  end
+  return nil
+end
+
+local function isOpened(e)
+  if e == nil then return false end
+  if e.opened and e.opened.Value == true then return true end
+  -- re-read in case the value instance changed
+  local ok, o = pcall(function() return e.model:FindFirstChild("Opened") end)
+  if ok and o and o.Value == true then
+    e.opened = o
+    return true
+  end
+  if e.prompt and e.prompt.Enabled == false then
+    -- disabled prompt usually means already taken; treat as done so we move on
+    return true
+  end
+  return false
+end
+
+-- remote resolution: exact name first, then auto-detect chest remotes.
+local function resolveRemote()
+  local want = (Flags.RemoteName ~= "" and Flags.RemoteName) or "OpenChest"
+  local okRs, rs = pcall(function() return game:GetService("ReplicatedStorage") end)
+  if not okRs or not rs then return nil end
+  local direct = rs:FindFirstChild(want, true)
+  if direct and (direct.ClassName == "RemoteEvent" or direct.ClassName == "UnreliableRemoteEvent" or direct.ClassName == "RemoteFunction") then
+    return direct
+  end
+  for _, d in ipairs(rs:GetDescendants()) do
+    if d.ClassName == "RemoteEvent" or d.ClassName == "UnreliableRemoteEvent" then
+      local nm = string.lower(d.Name)
+      if string.find(nm, "chest") or string.find(nm, "open") or string.find(nm, "loot") then return d end
+    end
+  end
+  return nil
+end
+
+local function getRemote()
+  if openRemote and openRemote.Parent ~= nil then return openRemote end
+  -- negative cache: a missing remote rescans ReplicatedStorage every chest
+  -- try (54 scans per sweep in prompt-only mode). re-check every 30s.
+  local now = tick()
+  if openRemote == nil and now - openRemoteCheckedAt < 30 then return nil end
+  openRemote = resolveRemote()
+  openRemoteCheckedAt = now
+  if openRemote then say("Remote: " .. tostring(openRemote.Name)) end
+  return openRemote
+end
+
+-- instant collect core: zero the hold time, then fire the prompt itself.
+-- never throws. returns true if a fire was attempted.
+local function holdPrompt(prompt)
+  pcall(function()
+    prompt.HoldDuration = 0
+    prompt.MaxActivationDistance = 1000
+    prompt.RequiresLineOfSight = false
+    prompt.Enabled = true
+  end)
+  if typeof(fireproximityprompt) == "function" then
+    local ok = pcall(fireproximityprompt, prompt)
+    if ok then return true end
+  end
+  if prompt.Triggered and typeof(prompt.Triggered.Fire) == "function" then
+    pcall(function() prompt.Triggered:Fire(LP) end)
+    return true
+  end
+  -- last resort: InputHoldBegin/End (some executors expose these)
+  pcall(function()
+    if prompt.InputHoldBegin then prompt:InputHoldBegin() end
+  end)
+  task.wait(0.1)
+  pcall(function()
+    if prompt.InputHoldEnd then prompt:InputHoldEnd() end
+  end)
+  return true
+end
+
+local function tryRemoteFallback(chestModel, num, attempt)
+  local rem = getRemote()
+  if not rem then
+    if not warnedNoRemote then
+      say("No chest remote found - prompt-only mode (this is fine, game server handles the prompt)")
+      warnedNoRemote = true
+    end
+    return
+  end
+  -- one payload per attempt so the server log stays clean:
+  -- try 1 = chest model (most common), try 2 = number, try 3 = string.
+  -- the prompt fire above is always tried first; this is only a fallback.
+  if rem.ClassName == "RemoteFunction" then
+    pcall(function() rem:InvokeServer(chestModel) end)
+    return
+  end
+  if attempt == 2 then
+    pcall(function() rem:FireServer(num) end)
+  elseif attempt == 3 then
+    pcall(function() rem:FireServer(tostring(num)) end)
+  else
+    pcall(function() rem:FireServer(chestModel) end)
+  end
+end
+
+local function gotoChest(pos, method, myToken)
+  local hrp = chestHRP()
+  if not hrp then return false end
+  if cancelled(myToken) then return false end
+  if method == "Tween" then
+    local from = hrp.Position
+    for i = 1, 10 do
+      if cancelled(myToken) then return false end
+      local t = i / 10
+      hrp.CFrame = CFrame.new(
+        from.X + (pos.X - from.X) * t,
+        from.Y + (pos.Y - from.Y) * t + 3,
+        from.Z + (pos.Z - from.Z) * t)
+      task.wait(0.05)
+    end
+  else
+    hrp.CFrame = CFrame.new(pos.X, pos.Y + 3, pos.Z)
+  end
+  return true
+end
+
+-- walk back to a remembered chest whose area isn't rendered.
+local function visitRemembered(num, pos, myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return nil end
+  local hrp = chestHRP()
+  if not hrp then return nil end
+  setStatus("Status: [" .. num .. "] area not rendered, walking back...")
+  hrp.CFrame = CFrame.new(pos.X, pos.Y + 3, pos.Z)
+  if typeof(LP.RequestStreamAroundAsync) == "function" then
+    pcall(function() LP:RequestStreamAroundAsync(pos) end)
+  end
+  -- same ~5s coverage with half the full-workspace rescans (each miss
+  -- walks the whole workspace, so fewer, slower retries cost less CPU).
+  for _ = 1, 5 do
+    if cancelled(myToken) then setStatus("Status: stopped") return nil end
+    task.wait(1)
+    if cancelled(myToken) then setStatus("Status: stopped") return nil end
+    local e = findChestByNum(num)
+    if e and e.prompt and e.part and e.part.Position then
+      say("Chest " .. num .. " streamed in")
+      return e
+    end
+  end
+  say("Chest " .. num .. " did not stream in, will retry later")
+  return nil
+end
+
+-- collect ONE numbered chest. always moves on after MaxTries. returns true if opened.
+local function collectOneNum(num, myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return false end
+  local e = findChestByNum(num)
+  if not e then
+    local mem = memory[num]
+    if mem then
+      e = visitRemembered(num, mem, myToken)
+    end
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
+  end
+  if not e then
+    setStatus("Status: [" .. num .. "] not found, skipping")
+    return false
+  end
+  if e.part == nil or e.part.Position == nil then
+    setStatus("Status: [" .. num .. "] has no position, skipping")
+    return false
+  end
+  if isOpened(e) then
+    setStatus("Status: [" .. num .. "] already opened, skipping")
+    return true
+  end
+  memory[num] = e.part.Position
+  if cancelled(myToken) then setStatus("Status: stopped") return false end
+  local moved = gotoChest(e.part.Position, Flags.Method, myToken)
+  if not moved then setStatus("Status: stopped") return false end
+  task.wait(0.25)
+  if cancelled(myToken) then setStatus("Status: stopped") return false end
+  for attempt = 1, Flags.MaxTries do
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    setStatus("Status: [" .. num .. "] opening (try " .. attempt .. "/" .. Flags.MaxTries .. ")...")
+    holdPrompt(e.prompt)
+    task.wait(0.6)
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    -- re-read opened state: prompt path alone is often enough
+    if isOpened(e) then
+      if not openedSet[num] then openedSet[num] = true uniqueOpened = uniqueOpened + 1 end
+      totalOpens = totalOpens + 1
+      updateChestCount()
+      setStatus("Status: [" .. num .. "] opened! (" .. uniqueOpened .. " unique)")
+      say("Opened chest " .. num)
+      return true
+    end
+    -- prompt alone failed: try the remote fallback once, then check again
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    tryRemoteFallback(e.model, num, attempt)
+    task.wait(0.5)
+    if cancelled(myToken) then setStatus("Status: stopped") return false end
+    -- re-read opened state
+    if isOpened(e) then
+      if not openedSet[num] then openedSet[num] = true uniqueOpened = uniqueOpened + 1 end
+      totalOpens = totalOpens + 1
+      updateChestCount()
+      setStatus("Status: [" .. num .. "] opened! (" .. uniqueOpened .. " unique)")
+      say("Opened chest " .. num)
+      return true
+    end
+    -- prompt may have been replaced; re-resolve once
+    if attempt < Flags.MaxTries then
+      task.wait(0.3)
+      if cancelled(myToken) then setStatus("Status: stopped") return false end
+      local fresh = findChestByNum(num)
+      if fresh then e = fresh end
+    end
+  end
+  setStatus("Status: [" .. num .. "] did not open after " .. Flags.MaxTries .. " tries, moving on")
+  return false
+end
+
+-- THE sweep: strict numeric order From -> To. never repeats a chest in one sweep.
+local function collectOrdered(myToken)
+  ensureCache()
+  lastSeen = {}
+  local total = Flags.To - Flags.From + 1
+  local done = 0
+  for num = Flags.From, Flags.To do
+    if cancelled(myToken) then setStatus("Status: stopped") return done end
+    setStatus("Status: going to chest " .. num .. " (" .. (done + 1) .. "/" .. total .. ")")
+    collectOneNum(num, myToken)
+    done = done + 1
+    if cancelled(myToken) then setStatus("Status: stopped") return done end
+    task.wait(Flags.Delay)
+    if cancelled(myToken) then setStatus("Status: stopped") return done end
+  end
+  if cancelled(myToken) then setStatus("Status: stopped") return done end
+  local left = 0
+  for num = Flags.From, Flags.To do
+    local e2 = cache[num]
+    if e2 and not isOpened(e2) then left = left + 1 end
+  end
+  if left == 0 then
+    setStatus("Status: sweep done - all chests opened!")
+  else
+    setStatus("Status: sweep done - " .. left .. " chest(s) still closed, run again")
+  end
+  return done
+end
+
+-- INSTANT BURST: teleport + fire every chest back-to-back with no per-chest
+-- verification waits, then ONE short wait and a single verify pass. As close
+-- to "all at once" as a distance-checking server allows: movement is still
+-- instant CFrame teleports (so proximity checks pass), with a small 0.15s
+-- beat per chest so it reads as fast movement rather than a same-frame
+-- vacuum (which is what anti-cheat flags). ~10s for all 54.
+local function collectInstant(myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  ensureCache()
+  local targets = {}
+  local skipped = 0
+  for num = Flags.From, Flags.To do
+    if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+    local e = cache[num]
+    if not e or e.model.Parent == nil or not e.prompt or e.prompt.Parent == nil then
+      e = findChestByNum(num)
+    end
+    if e and e.part and e.part.Position and not isOpened(e) then
+      targets[#targets + 1] = e
+    elseif not e then
+      skipped = skipped + 1
+    end
+  end
+  if #targets == 0 then
+    setStatus("Status: burst done - nothing closed to open" .. (skipped > 0 and " (" .. skipped .. " not found)" or ""))
+    say("Instant burst: nothing to open")
+    return 0
+  end
+  setStatus("Status: burst - firing " .. #targets .. " chests...")
+  say("Instant burst: firing " .. #targets .. " chests back-to-back")
+  for _, e in ipairs(targets) do
+    if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+    local hrp = chestHRP()
+    if hrp then
+      pcall(function()
+        hrp.CFrame = CFrame.new(e.part.Position.X, e.part.Position.Y + 3, e.part.Position.Z)
+      end)
+    end
+    holdPrompt(e.prompt)
+    tryRemoteFallback(e.model, e.num, 1)
+    task.wait(0.15)
+  end
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  task.wait(1.5)
+  local opened = 0
+  for _, e in ipairs(targets) do
+    if cancelled(myToken) then setStatus("Status: stopped") return opened end
+    if isOpened(e) then
+      if not openedSet[e.num] then openedSet[e.num] = true uniqueOpened = uniqueOpened + 1 end
+      totalOpens = totalOpens + 1
+      opened = opened + 1
+    end
+  end
+  updateChestCount()
+  local left = #targets - opened
+  if left == 0 then
+    setStatus("Status: burst done - all " .. opened .. " opened!" .. (skipped > 0 and " (" .. skipped .. " not found)" or ""))
+  else
+    setStatus("Status: burst done - " .. opened .. "/" .. #targets .. " opened, " .. left .. " need the normal sweep")
+  end
+  say("Instant burst: " .. opened .. "/" .. #targets .. " opened")
+  return opened
+end
+
+-- legacy nearest-first single pass (kept for the old button).
+local function collectNearestOnce(myToken)
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  ensureCache()
+  local hrp = chestHRP()
+  if not hrp then
+    setStatus("Status: waiting for character...")
+    return 0
+  end
+  local best = nil
+  local bestD = 1e9
+  for num = Flags.From, Flags.To do
+    local e = findChestByNum(num)
+    if e and not isOpened(e) and e.part and e.part.Position then
+      local d = dist3(hrp.Position, e.part.Position)
+      if d <= Flags.Radius and d < bestD then bestD = d best = e end
+    end
+  end
+  if not best then
+    setStatus("Status: 0 chest(s) in range")
+    return 0
+  end
+  if cancelled(myToken) then setStatus("Status: stopped") return 0 end
+  setStatus("Status: going to nearest chest " .. best.num)
+  collectOneNum(best.num, myToken)
+  return 1
 end
 
 -- VantixUI load (real) or fallback shim (editor mock)
@@ -914,6 +1606,7 @@ if FALLBACK then
     function tab:AddSlider(def) return makeElement(def) end
     function tab:AddButton(def) return makeElement(def) end
     function tab:AddDropdown(def) return makeElement(def) end
+    function tab:AddMultiDropdown(def) return makeElement(def) end
     function tab:AddLabel(text, _) return makeElement({ Default = text }) end
     function tab:AddConsole(_) return makeElement({}) end
     function tab:AddSeparator() end
@@ -990,6 +1683,10 @@ farmToggle = FarmTab:AddToggle({
     if not state then
       followToken = followToken + 1
       setFloat(false)
+      setNoclip(false)
+    else
+      setNoclip(true)
+      ensureAntiAfk()
     end
     say("NPC farm " .. (state and "enabled" or "disabled"))
     setStatus(state and "Status: npc farm on" or "Status: stopped")
@@ -1057,6 +1754,21 @@ FarmTab:AddDropdown({
   end,
 })
 
+FarmTab:AddDropdown({
+  Title   = "Move Method",
+  Icon    = "move",
+  Options = {"Instant", "Glide (anti rubber-band)"},
+  Default = 1,
+  Callback = function(selected)
+    if selected == 2 or selected == "Glide (anti rubber-band)" or selected == "Glide" then
+      Flags.FarmMethod = "Glide"
+    else
+      Flags.FarmMethod = "Instant"
+    end
+    say("Move method: " .. Flags.FarmMethod)
+  end,
+})
+
 FarmTab:AddButton({
   Title    = "Go To NPC",
   Subtitle = "One pass over the current target (no loop)",
@@ -1079,6 +1791,7 @@ FarmTab:AddButton({
     Flags.NpcFarm = false
     followToken = followToken + 1
     setFloat(false)
+    setNoclip(false)
     pcall(function() if farmToggle then farmToggle:Set(false) end end)
     say("Landed - physics back to normal")
     setStatus("Status: stopped")
@@ -1092,60 +1805,21 @@ local SkillsTab = Window:AddTab("Skills", "zap")
 
 SkillsTab:AddLabel("Only checked skills fire (rotation + combo)", "zap")
 
-local skillToggles = {}
-local skillDefs = {
-  { Key = "M1", Title = "Skill: M1 / Punch (LMB combo)", Subtitle = "Tap" },
-  { Key = "M2", Title = "Skill: M2 / Secondary (double RMB)", Subtitle = "Tap x2" },
-  { Key = "E", Title = "Skill: E / Ability 1 Barrage (hold 3s)", Subtitle = "Hold, then release" },
-  { Key = "R", Title = "Skill: R / Ability 2 Heavy breaker", Subtitle = "Tap" },
-  { Key = "G", Title = "Skill: G / Ability 3 Signature", Subtitle = "Tap" },
-  { Key = "C", Title = "Skill: C / Ability 4 Mobility", Subtitle = "Tap" },
-  { Key = "X", Title = "Skill: X / Ability 5 Special", Subtitle = "Tap" },
-  { Key = "V", Title = "Skill: V / Ability 6 Ultimate", Subtitle = "Tap" },
-}
-for _, def in ipairs(skillDefs) do
-  local key = def.Key
-  skillToggles[key] = SkillsTab:AddToggle({
-    Title    = def.Title,
-    Subtitle = def.Subtitle,
-    Icon     = "zap",
-    Default  = true,
-    Callback = function(state)
-      Flags.Skills[key] = state
-      say("Skill " .. key .. (state and " on" or " off"))
-    end,
-  })
-end
-
-SkillsTab:AddButton({
-  Title    = "All Skills",
-  Subtitle = "Check every skill",
-  Icon     = "check",
-  Text     = "All",
-  Callback = function()
+SkillsTab:AddMultiDropdown({
+  Title    = "Skills",
+  Subtitle = "Only checked skills fire",
+  Icon     = "zap",
+  Options  = {"M1", "M2", "E", "R", "G", "C", "X", "V"},
+  Default  = {"M1", "M2", "E", "R", "G", "C", "X", "V"},
+  Callback = function(selected)
     for _, k in ipairs(SKILL_LIST) do
-      Flags.Skills[k] = true
+      Flags.Skills[k] = selected[k] and true or false
     end
-    for _, el in pairs(skillToggles) do
-      pcall(function() el:Set(true) end)
-    end
-    say("Skills: all on")
-  end,
-})
-
-SkillsTab:AddButton({
-  Title    = "No Skills",
-  Subtitle = "Uncheck every skill (teleport only)",
-  Icon     = "x",
-  Text     = "None",
-  Callback = function()
+    local n = 0
     for _, k in ipairs(SKILL_LIST) do
-      Flags.Skills[k] = false
+      if Flags.Skills[k] then n = n + 1 end
     end
-    for _, el in pairs(skillToggles) do
-      pcall(function() el:Set(false) end)
-    end
-    say("Skills: all off")
+    say("Skills: " .. n .. "/8 on")
   end,
 })
 
@@ -1195,6 +1869,7 @@ Flags.Delay = 0.5
 Flags.InOrder = true
 Flags.Radius = 1000
 Flags.RemoteName = "OpenChest"
+Flags.MaxTries = 3
 
 local ChestsTab = Window:AddTab("Chests", "archive")
 
@@ -1203,11 +1878,23 @@ chestCount = ChestsTab:AddLabel("Opened: 0 / 54 (0 total)", "trophy")
 
 chestAuto = ChestsTab:AddToggle({
   Title    = "Auto Collect",
-  Subtitle = "Loops 1->54 in order (chest module)",
+  Subtitle = "Loops 1->54 in order",
   Icon     = "repeat",
   Default  = false,
   Callback = function(state)
     Flags.Auto = state
+    sweepToken = sweepToken + 1
+    if state then
+      local myToken = sweepToken
+      task.spawn(function()
+        say("Auto Collect looping " .. Flags.From .. "->" .. Flags.To)
+        while Flags.Auto and not cancelled(myToken) do
+          collectOrdered(myToken)
+          if Flags.Auto and not cancelled(myToken) then task.wait(2) end
+        end
+        setStatus("Status: stopped")
+      end)
+    end
     say("Auto Collect " .. (state and "enabled" or "disabled"))
     Window:Notify({ Title = "Auto Collect", Text = state and "Enabled" or "Disabled", Duration = 2 })
     setStatus(state and "Status: auto on (1->54)" or "Status: stopped")
@@ -1287,34 +1974,51 @@ ChestsTab:AddDropdown({
 
 ChestsTab:AddButton({
   Title    = "Collect 1-54 In Order",
-  Subtitle = "One sweep via the chest module",
+  Subtitle = "One sweep, strict order",
   Icon     = "list-ordered",
   Text     = "Start 1-54",
   Callback = function()
-    say("Sweep requested: " .. Flags.From .. " -> " .. Flags.To .. " (chest module)")
-    setStatus("Status: sweep running (module)")
+    sweepToken = sweepToken + 1
+    local myToken = sweepToken
+    say("Sweep running: " .. Flags.From .. " -> " .. Flags.To)
+    setStatus("Status: sweep running")
     Window:Notify({ Title = "Chests", Text = "Sweep running", Duration = 2 })
+    task.spawn(function()
+      local n = collectOrdered(myToken)
+      say("Sweep done: " .. n .. " chests visited")
+    end)
   end,
 })
 
 ChestsTab:AddButton({
   Title    = "Instant Burst",
-  Subtitle = "Fires every chest back-to-back (chest module)",
+  Subtitle = "Fires every chest back-to-back",
   Icon     = "zap",
   Text     = "Burst",
   Callback = function()
-    say("Burst requested (chest module)")
-    setStatus("Status: burst running (module)")
+    sweepToken = sweepToken + 1
+    local myToken = sweepToken
+    say("Burst running...")
+    setStatus("Status: burst running")
+    task.spawn(function()
+      local n = collectInstant(myToken)
+      say("Burst done: " .. n .. " opened")
+    end)
   end,
 })
 
 ChestsTab:AddButton({
   Title    = "Collect Nearest",
-  Subtitle = "One chest, closest first (chest module)",
+  Subtitle = "One chest, closest first",
   Icon     = "mouse-pointer",
   Text     = "Collect",
   Callback = function()
-    say("Nearest requested (chest module)")
+    sweepToken = sweepToken + 1
+    local myToken = sweepToken
+    say("Nearest pass started")
+    task.spawn(function()
+      collectNearestOnce(myToken)
+    end)
   end,
 })
 
@@ -1325,6 +2029,7 @@ ChestsTab:AddButton({
   Text     = "Stop",
   Callback = function()
     Flags.Auto = false
+    sweepToken = sweepToken + 1
     pcall(function() if chestAuto then chestAuto:Set(false) end end)
     setStatus("Status: stopped")
     say("Stopped")
@@ -1333,12 +2038,13 @@ ChestsTab:AddButton({
 
 ChestsTab:AddButton({
   Title    = "Rebuild Chest Cache",
-  Subtitle = "Full rescan (chest module)",
+  Subtitle = "Full rescan (rebuilds cache)",
   Icon     = "refresh-cw",
   Text     = "Rebuild",
   Callback = function()
-    say("Cache rebuild requested (chest module)")
-    setStatus("Status: rebuild requested")
+    buildCache()
+    setStatus("Status: cache rebuilt")
+    say("Cache rebuilt")
   end,
 })
 
@@ -1432,6 +2138,35 @@ if FALLBACK then
     npcTarget = "All"
     local n = farmNpcsOnce()
     say("NPC demo: visited " .. n)
+    -- demo chests 1..8: firing the prompt marks them opened, the way a
+    -- real game server would. then a real ordered sweep collects them.
+    local function makeDemoChest(i)
+      local m = Instance.new("Model")
+      m.Name = tostring(i)
+      local part = Instance.new("Part")
+      part.Name = "ChestPart"
+      part.Position = Vector3.new(-60 + i * 16, 3, (i % 2) * 30 - 15)
+      part.Anchored = true
+      part.Parent = m
+      local opened = Instance.new("BoolValue")
+      opened.Name = "Opened"
+      opened.Value = false
+      opened.Parent = m
+      local prompt = Instance.new("ProximityPrompt")
+      prompt.HoldDuration = 0.5
+      prompt.MaxActivationDistance = 10
+      prompt.Parent = part
+      prompt.Triggered:Connect(function() opened.Value = true end)
+      return m
+    end
+    for i = 1, 8 do makeDemoChest(i).Parent = workspace end
+    print("Demo: 8 chests placed (stand-ins for your 1..54).")
+    local savedFrom, savedTo = Flags.From, Flags.To
+    Flags.From, Flags.To = 1, 8
+    collectOrdered(nil)
+    Flags.From, Flags.To = savedFrom, savedTo
+    updateChestCount()
+    say("Chest demo: 8/8 opened")
   end
   setStatus("Status: ready - pick a tab")
   say("Demo done: main window ready.")
