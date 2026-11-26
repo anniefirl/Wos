@@ -968,6 +968,10 @@ MainTab:AddButton({
   Callback = function() Window:Destroy() end,
 })
 
+MainTab:AddLabel("Controls: hold F block, tap F parry (beats Bloodbath), Ctrl dash, Shift shift-lock aim. R breaks guards", "gamepad")
+MainTab:AddLabel("Storage: Dio storyline unlocks Stand Storage. unused Specialized Arrows = free extra storage", "box")
+MainTab:AddLabel("Codes: Menu > Settings/Stats > Codes box (case-sensitive, most need Lv 10-25). check Discord", "ticket")
+
 console = MainTab:AddConsole({ Title = "Activity Log", Height = 110 })
 console:Write("Serene loaded - farm in the Farm tab, chests in the Chests tab")
 
@@ -1081,22 +1085,12 @@ FarmTab:AddButton({
   end,
 })
 
-FarmTab:AddButton({
-  Title    = "Test Skills (no teleport)",
-  Subtitle = "Fires where you stand - respects the Auto Combo toggle",
-  Icon     = "flask",
-  Text     = "Test",
-  Callback = function()
-    task.spawn(function()
-      say("Skill test: firing in place...")
-      fireRotation()
-      say("Skill test done - if nothing fired, read the Input: line above")
-    end)
-  end,
-})
+FarmTab:AddLabel("Aim: pinned hover, facing the NPC. single target locks + follows. ranged 10-15, else 5-8 (auto-set on pick)", "crosshair")
 
+-- Skills tab: everything about firing lives here, Farm tab only aims.
+local SkillsTab = Window:AddTab("Skills", "zap")
 
-FarmTab:AddLabel("Skills (multi-select): only checked skills fire", "zap")
+SkillsTab:AddLabel("Only checked skills fire (rotation + combo)", "zap")
 
 local skillToggles = {}
 local skillDefs = {
@@ -1111,7 +1105,7 @@ local skillDefs = {
 }
 for _, def in ipairs(skillDefs) do
   local key = def.Key
-  skillToggles[key] = FarmTab:AddToggle({
+  skillToggles[key] = SkillsTab:AddToggle({
     Title    = def.Title,
     Subtitle = def.Subtitle,
     Icon     = "zap",
@@ -1123,7 +1117,7 @@ for _, def in ipairs(skillDefs) do
   })
 end
 
-FarmTab:AddButton({
+SkillsTab:AddButton({
   Title    = "All Skills",
   Subtitle = "Check every skill",
   Icon     = "check",
@@ -1139,7 +1133,7 @@ FarmTab:AddButton({
   end,
 })
 
-FarmTab:AddButton({
+SkillsTab:AddButton({
   Title    = "No Skills",
   Subtitle = "Uncheck every skill (teleport only)",
   Icon     = "x",
@@ -1155,7 +1149,7 @@ FarmTab:AddButton({
   end,
 })
 
-FarmTab:AddToggle({
+SkillsTab:AddToggle({
   Title    = "Auto Combo",
   Subtitle = "3x M1, E hold, 3x M1, R, G/V, C, X - cooling skips, Commons have no V",
   Icon     = "swords",
@@ -1166,7 +1160,7 @@ FarmTab:AddToggle({
   end,
 })
 
-FarmTab:AddToggle({
+SkillsTab:AddToggle({
   Title    = "Common Stand (no V)",
   Subtitle = "Skips V - Sun/Emperor have no Ultimate",
   Icon     = "slash",
@@ -1177,8 +1171,21 @@ FarmTab:AddToggle({
   end,
 })
 
-FarmTab:AddLabel("Aim: pinned hover, facing the NPC. single target locks + follows. ranged/AoE (Tarkus, Bruford, guns, Banks, Straizo, Esidisi): hover 10-15. melee: hover 5-8. E = barrage hold, R = breaker, G = signature, C = mobility, X = special, V = ultimate", "crosshair")
+SkillsTab:AddButton({
+  Title    = "Test Skills (no teleport)",
+  Subtitle = "Fires where you stand - respects the Auto Combo toggle",
+  Icon     = "flask",
+  Text     = "Test",
+  Callback = function()
+    task.spawn(function()
+      say("Skill test: firing in place...")
+      fireRotation()
+      say("Skill test done - if nothing fired, read the Input: line above")
+    end)
+  end,
+})
 
+SkillsTab:AddLabel("E = barrage hold, R = breaker, G = signature, C = mobility, X = special, V = ultimate", "crosshair")
 -- chest tab config (used only by the Chests tab below)
 Flags.Auto = false
 Flags.From = 1
@@ -1367,9 +1374,6 @@ IntelTab:AddLabel("Specs: Stone Mask->Vamp, Scarf->Hamon, Red Stone+Vamp->ULF, C
 IntelTab:AddLabel("Spawns: mobs groups of 3-5, 15-30s. bosses 1 at a time, 1-3 min. domains reset on re-entry", "timer")
 IntelTab:AddLabel("Repeatable: Busy Businessman (London, by Dio castle) wants 3 Vampires + 1 Strong Vampire. grab the giver by your farm spot", "repeat")
 IntelTab:AddLabel("London sides: John G. Legend = free arrow. Grieving Mother = Student ID from Evil Vamps", "gift")
-IntelTab:AddLabel("Controls: hold F block, tap F parry (beats Bloodbath), Ctrl dash, Shift shift-lock aim. R breaks guards", "gamepad")
-IntelTab:AddLabel("Storage: Dio storyline unlocks Stand Storage. unused Specialized Arrows = free extra storage", "box")
-IntelTab:AddLabel("Codes: Menu > Settings/Stats > Codes box (case-sensitive, most need Lv 10-25). check Discord", "ticket")
 IntelTab:AddLabel("Geb: Corrupt Ruins quest - 3 Purified Water + arrow + 50k gold = Purified Arrow", "droplet")
 
 local AboutTab = Window:AddTab("About", "heart")
