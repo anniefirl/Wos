@@ -12,23 +12,67 @@ local MODULE_URLS = {
 local Players = game:GetService("Players")
 local LP = Players.LocalPlayer
 
--- NPC farm targets: exact in-game names (NY / London / Egypt / Cairo).
--- Matching is case-insensitive, ID-style names ("VampireEnforcer") match too.
-local NPC_LIST = {"Slugger", "Criminal", "Corrupt Cop", "Capo", "Mobster",
-  "Vampire Capo", "Vampire Mobster", "Pillar Man", "Sewer Pillar Man",
-  "Elite Pillar Man", "Esidisi", "Straizo", "Banks",
-  "Thug", "Strong Thug", "Evil Vampire", "Slightly More Eviler Vampire",
-  "Speedwagon Gang Member", "Bruford", "Tarkus",
-  "Desert Bandit", "Bandit Captain", "Chaka", "King of the Thugs"}
+-- NPC farm targets: exact in-game names, ordered weakest -> strongest
+-- (London 1-12 -> NY/Sewers 12-28 -> Hamon domain -> Desert 30+).
+-- Matching is case-insensitive; Esidisi also matches Eisidisi/sidisi,
+-- and "Sewer Pillar Man" also matches plain "Pillar Man" models
+-- (sewer ones are labeled Pillar Man in-game). ID-style names
+-- ("VampireEnforcer") match too via normalization.
+local NPC_LIST = {"Thug", "Speedwagon Gang Member", "Strong Thug",
+  "King of the Thugs", "Tarkus", "Evil Vampire",
+  "Slightly More Eviler Vampire", "Bruford", "Criminal", "Slugger",
+  "Corrupt Cop", "Mobster", "Capo", "Banks",
+  "Vampire Mobster", "Vampire Capo", "Sewer Pillar Man", "Straizo",
+  "Pillar Man", "Elite Pillar Man", "Esidisi",
+  "Desert Bandit", "Bandit Captain", "Chaka"}
+
+-- farming intel (from the farming guide): level, zone, ranged flag.
+-- ranged/AoE NPCs need high hover (10-15), melee can sit low (5-8).
+local NPC_INFO = {
+  ["Thug"] = { lv = "1-3", zone = "London", ranged = false },
+  ["Speedwagon Gang Member"] = { lv = "2-4", zone = "London Ogre St", ranged = false },
+  ["Strong Thug"] = { lv = "4-6", zone = "London alleys", ranged = false },
+  ["King of the Thugs"] = { lv = "5-8", zone = "London alley boss", ranged = false, boss = true },
+  ["Tarkus"] = { lv = "6", zone = "London graveyard", ranged = true, boss = true },
+  ["Evil Vampire"] = { lv = "7-10", zone = "London outskirts", ranged = false },
+  ["Slightly More Eviler Vampire"] = { lv = "10", zone = "Near Dio castle", ranged = true },
+  ["Bruford"] = { lv = "6-12", zone = "Hill by Dio castle", ranged = true, boss = true },
+  ["Criminal"] = { lv = "12-15", zone = "NY streets", ranged = false },
+  ["Slugger"] = { lv = "12-15", zone = "NY streets", ranged = false },
+  ["Corrupt Cop"] = { lv = "14-17", zone = "NY police stn", ranged = true },
+  ["Mobster"] = { lv = "15-18", zone = "NY docks", ranged = true },
+  ["Capo"] = { lv = "17-20", zone = "NY docks", ranged = true },
+  ["Banks"] = { lv = "18-21", zone = "Warehouse 419 (code 419)", ranged = true, boss = true },
+  ["Vampire Mobster"] = { lv = "20-23", zone = "NY sewers", ranged = true },
+  ["Vampire Capo"] = { lv = "22-25", zone = "NY sewers", ranged = true },
+  ["Sewer Pillar Man"] = { lv = "23-26", zone = "NY sewers", ranged = true },
+  ["Straizo"] = { lv = "24-27", zone = "Sewer secret lab", ranged = true, boss = true },
+  ["Pillar Man"] = { lv = "21-26", zone = "Hamon domain", ranged = true },
+  ["Elite Pillar Man"] = { lv = "25-28", zone = "Hamon zigzag bridge", ranged = true },
+  ["Esidisi"] = { lv = "26", zone = "Hamon boss room", ranged = true, boss = true },
+  ["Desert Bandit"] = { lv = "30-35", zone = "Stardust desert", ranged = true },
+  ["Bandit Captain"] = { lv = "33-38", zone = "Desert camps", ranged = true },
+  ["Chaka"] = { lv = "35-40", zone = "Corrupt ruins boss", ranged = false, boss = true },
+}
+
+local function npcTip(name)
+  local info = NPC_INFO[name]
+  if info == nil then return name end
+  local h = info.ranged and "hover 10-15 (ranged/AoE)" or "hover 5-8 (melee)"
+  return name .. " Lv " .. info.lv .. " " .. info.zone .. " - " .. h
+end
 local npcTarget = "All"
+local floatPos = "Above" -- "Above" | "Behind" | "Below"
 
 -- farm skill selection (multi-select, all on by default).
--- M1 = left mouse click, E = hold 3s, R/G/C/X/V = taps.
-local SKILL_LIST = {"M1", "E", "R", "G", "C", "X", "V"}
+-- M1 = Punch tap, M2 = Secondary tap, E = Ability 1 hold 3s,
+-- R/G/C/X/V = Ability 2/3/4/5/6 taps. on mobile these tap the
+-- on-screen buttons, on PC they press keys. never throws.
+local SKILL_LIST = {"M1", "M2", "E", "R", "G", "C", "X", "V"}
 
-local Flags = { Drop = false, NpcFarm = false,
+local Flags = { Drop = false, NpcFarm = false, Combo = false, NoV = false,
   DropsLoaded = false, NpcHeight = 5,
-  Skills = { M1 = true, E = true, R = true,
+  Skills = { M1 = true, M2 = true, E = true, R = true,
     G = true, C = true, X = true, V = true } }
 
 -- created by the UI below, callbacks only use them later
@@ -37,8 +81,11 @@ local countLabel = nil
 local console = nil
 local farmStatus = nil
 local farmCount = nil
+local heightSlider = nil
+local npcDropdown = nil
 local dropsLoadedLabel = nil
 local dropToggle = nil
+local farmToggle = nil
 local chestStatus = nil
 local chestCount = nil
 local chestAuto = nil
@@ -112,6 +159,19 @@ local function normName(s)
   return (string.gsub(s, "[^%a%d]", ""))
 end
 
+local function namesMatch(wantNorm, modelNorm)
+  if wantNorm == modelNorm then return true end
+  -- wiki spells him Eisidisi / Esidisi interchangeably
+  if wantNorm:find("sidisi", 1, true) and modelNorm:find("sidisi", 1, true) then
+    return true
+  end
+  -- sewer pillar men show as plain "Pillar Man" in-game
+  if wantNorm == "sewerpillarman" and modelNorm == "pillarman" then
+    return true
+  end
+  return false
+end
+
 local function findNpcByName(name)
   local want = string.lower(name or "")
   local wantNorm = normName(name)
@@ -120,7 +180,7 @@ local function findNpcByName(name)
     if d.ClassName == "Model" and d.Name then
       if string.lower(d.Name) == want then
         if rootPartOf(d) then return d end
-      elseif normName(d.Name) == wantNorm and fallback == nil then
+      elseif namesMatch(wantNorm, normName(d.Name)) and fallback == nil then
         if rootPartOf(d) then fallback = d end
       end
     end
@@ -171,6 +231,197 @@ local function setFloat(on)
   end
 end
 
+-- float position pose for the farm pin. Above = overhead looking down,
+-- Behind = 3 studs behind the NPC (its facing, world +Z fallback) at
+-- hover height facing it, Below = underneath looking up. mock-safe
+-- (no CFrame*Vector3, yaw via two-arg atan).
+local function modeLabel()
+  if floatPos == "Behind" then return "3 studs behind" end
+  if floatPos == "Below" then return "below" end
+  return "above"
+end
+
+local function hoverPose(rp)
+  local h = Flags.NpcHeight or 5
+  if floatPos == "Behind" then
+    local lx, lz = 0, 1
+    pcall(function()
+      local lv = rp.CFrame.LookVector
+      if lv ~= nil and lv.X ~= nil then lx, lz = lv.X, lv.Z end
+    end)
+    local len = math.sqrt(lx * lx + lz * lz)
+    if len > 0.001 then lx, lz = lx / len, lz / len end
+    local px = rp.Position.X - lx * 3
+    local pz = rp.Position.Z - lz * 3
+    local yaw = 0
+    pcall(function()
+      yaw = math.atan(-(rp.Position.X - px), -(rp.Position.Z - pz))
+    end)
+    return CFrame.new(px, rp.Position.Y + h, pz) * CFrame.Angles(0, yaw, 0)
+  end
+  if floatPos == "Below" then
+    return CFrame.new(rp.Position.X, rp.Position.Y - h, rp.Position.Z)
+      * CFrame.Angles(math.rad(90), 0, 0)
+  end
+  return CFrame.new(rp.Position.X, rp.Position.Y + h, rp.Position.Z)
+    * CFrame.Angles(math.rad(-90), 0, 0)
+end
+
+-- teleports the player to the current float pose + pins. returns false
+-- when there is nothing to pin to. never throws.
+local function pinTo(rp)
+  local hrp = getPlayerHRP()
+  if hrp == nil or rp == nil or rp.Position == nil then return false end
+  pcall(function() hrp.CFrame = hoverPose(rp) end)
+  setFloat(true)
+  return true
+end
+
+-- mobile-to-PC skill map (from the phone HUD: Punch / Secondary buttons
+-- plus the Ability 1-6 circles and the 1-6 hotbar underneath them).
+local MOBILE_BUTTON = {
+  M1 = "Punch", M2 = "Secondary",
+  E = "Ability 1", R = "Ability 2", G = "Ability 3",
+  C = "Ability 4", X = "Ability 5", V = "Ability 6",
+}
+local mobileBtnCache = {}
+local touchReported = false
+
+local function normBtn(s)
+  s = string.lower(s or "")
+  return (string.gsub(s, "[^%a%d]", ""))
+end
+
+local function isBtn(d)
+  local ok, res = pcall(function()
+    return d:IsA("TextButton") or d:IsA("ImageButton")
+  end)
+  return ok and res
+end
+
+-- finds the touch button for a skill, cached, rescans when the HUD rebuilds.
+-- returns nil on PC (no touch buttons) so callers fall back to keys.
+local function findMobileButton(skillKey)
+  local want = MOBILE_BUTTON[skillKey]
+  if want == nil then return nil end
+  local cached = mobileBtnCache[skillKey]
+  if cached ~= nil then
+    local alive = false
+    pcall(function() alive = cached.Parent ~= nil end)
+    if alive then return cached end
+    mobileBtnCache[skillKey] = nil
+  end
+  local pg = nil
+  pcall(function()
+    if LP.FindFirstChildOfClass then pg = LP:FindFirstChildOfClass("PlayerGui") end
+  end)
+  if pg == nil then
+    pcall(function() pg = LP:FindFirstChild("PlayerGui") end)
+  end
+  if pg == nil then return nil end
+  local desc = nil
+  pcall(function() desc = pg:GetDescendants() end)
+  if desc == nil then return nil end
+  local wantNorm = normBtn(want)
+  local fallback = nil
+  for _, d in ipairs(desc) do
+    if isBtn(d) then
+      local name = ""
+      pcall(function() name = normBtn(d.Name) end)
+      local text = ""
+      pcall(function() text = normBtn(d.Text) end)
+      local vis = true
+      pcall(function() vis = d.Visible end)
+      if vis and (name == wantNorm or text == wantNorm) then
+        -- exact ability hits win over bare-number hotbar text ("1")
+        if name:find("ability", 1, true) then
+          mobileBtnCache[skillKey] = d
+          if not touchReported then
+            touchReported = true
+            say("Touch controls found - tapping on-screen buttons")
+          end
+          return d
+        elseif fallback == nil then
+          fallback = d
+        end
+      end
+    end
+  end
+  if fallback ~= nil then
+    mobileBtnCache[skillKey] = fallback
+    if not touchReported then
+      touchReported = true
+      say("Touch controls found - tapping on-screen buttons")
+    end
+  end
+  return fallback
+end
+
+-- taps (or holds) a touch button: firesignal when the executor has it,
+-- else a VirtualUser tap at the button's screen center. returns true if
+-- anything was sent. never throws.
+local function tapButton(btn, holdSecs)
+  local vu = nil
+  pcall(function() vu = game:GetService("VirtualUser") end)
+  local center = nil
+  pcall(function()
+    local p = btn.AbsolutePosition
+    local s = btn.AbsoluteSize
+    center = Vector2.new(p.X + s.X / 2, p.Y + s.Y / 2)
+  end)
+  local cam = nil
+  pcall(function() cam = workspace.CurrentCamera end)
+  if holdSecs ~= nil and holdSecs > 0 then
+    local held = false
+    pcall(function()
+      if firesignal then
+        if center then
+          firesignal(btn.MouseButton1Down, center.X, center.Y)
+        else
+          firesignal(btn.MouseButton1Down)
+        end
+        held = true
+      end
+    end)
+    if held then
+      task.wait(holdSecs)
+      pcall(function()
+        if center then
+          firesignal(btn.MouseButton1Up, center.X, center.Y)
+        else
+          firesignal(btn.MouseButton1Up)
+        end
+      end)
+      return true
+    end
+    if vu ~= nil and center ~= nil then
+      local down = pcall(function()
+        if cam then vu:Button1Down(center, cam) else vu:Button1Down(center) end
+      end)
+      if down then
+        task.wait(holdSecs)
+        pcall(function()
+          if cam then vu:Button1Up(center, cam) else vu:Button1Up(center) end
+        end)
+        return true
+      end
+    end
+    return false
+  end
+  local sigged = false
+  pcall(function()
+    if firesignal then firesignal(btn.Activated) sigged = true end
+  end)
+  if sigged then return true end
+  if vu ~= nil and center ~= nil then
+    local tapped = pcall(function()
+      if cam then vu:ClickButton1(center, cam) else vu:ClickButton1(center) end
+    end)
+    if tapped then return true end
+  end
+  return false
+end
+
 -- one-shot input status line so a real executor tells the truth: if the
 -- executor blocks VirtualInputManager, key/mouse presses can never land
 -- and the log says so instead of silently doing nothing.
@@ -188,88 +439,378 @@ local function reportInput(vim)
   end)
 end
 
--- skill rotation after each teleport. only fires skills enabled in
--- Flags.Skills (Farm tab multi-select). M1 left click, E held 3s,
--- R G C X V taps. fires through VirtualInputManager with mouse1click /
--- keypress fallbacks where the executor exposes them; the editor mock
--- has no input service, so it just logs the rotation. never throws.
-local function useSkills()
-  local skills = Flags.Skills
-  local any = false
-  for _, k in ipairs(SKILL_LIST) do
-    if skills[k] then any = true break end
+-- shared input primitives (rotation + combo both use these).
+local cachedVim = "none"
+local function getVim()
+  if cachedVim == "none" then
+    cachedVim = nil
+    pcall(function() cachedVim = game:GetService("VirtualInputManager") end)
+    reportInput(cachedVim)
   end
-  if not any then
-    say("Skills: none selected, skipping rotation")
-    return
+  return cachedVim
+end
+
+local function vimClick()
+  local vim = getVim()
+  if vim then
+    local ok = pcall(function()
+      vim:SendMouseButtonEvent(500, 500, 0, true, game, 0)
+      task.wait(0.1)
+      vim:SendMouseButtonEvent(500, 500, 0, false, game, 0)
+    end)
+    if ok then return end
   end
-  local vim = nil
-  pcall(function() vim = game:GetService("VirtualInputManager") end)
-  reportInput(vim)
-  local function clickM1()
-    if vim then
-      local ok = pcall(function()
-        vim:SendMouseButtonEvent(500, 500, 0, true, game, 0)
-        task.wait(0.1)
-        vim:SendMouseButtonEvent(500, 500, 0, false, game, 0)
-      end)
-      if ok then return end
+  pcall(function()
+    if mouse1click then
+      mouse1click()
+    elseif mouse1press and mouse1release then
+      mouse1press()
+      task.wait(0.1)
+      mouse1release()
     end
+  end)
+end
+
+-- M2 / Secondary is a DOUBLE right click in-game (wiki Basics page).
+local function vimRightClick()
+  local vim = getVim()
+  if vim then
     pcall(function()
-      if mouse1click then
-        mouse1click()
-      elseif mouse1press and mouse1release then
-        mouse1press()
+      for _ = 1, 2 do
+        vim:SendMouseButtonEvent(500, 500, 1, true, game, 0)
         task.wait(0.1)
-        mouse1release()
+        vim:SendMouseButtonEvent(500, 500, 1, false, game, 0)
+        task.wait(0.15)
       end
     end)
   end
-  local function keyDown(code)
-    if vim then
-      local ok = pcall(function() vim:SendKeyEvent(true, code, false, game) end)
-      if ok then return true end
-    end
-    local keyVal = code
-    pcall(function() if code.Value ~= nil then keyVal = code.Value end end)
-    local pressed = false
-    pcall(function()
-      if keypress then keypress(keyVal) pressed = true end
-    end)
-    return pressed
+end
+
+local function keyDown(code)
+  local vim = getVim()
+  if vim then
+    local ok = pcall(function() vim:SendKeyEvent(true, code, false, game) end)
+    if ok then return true end
   end
-  local function keyUp(code)
-    if vim then
-      pcall(function() vim:SendKeyEvent(false, code, false, game) end)
+  local keyVal = code
+  pcall(function() if code.Value ~= nil then keyVal = code.Value end end)
+  local pressed = false
+  pcall(function()
+    if keypress then keypress(keyVal) pressed = true end
+  end)
+  return pressed
+end
+
+local function keyUp(code)
+  local vim = getVim()
+  if vim then
+    pcall(function() vim:SendKeyEvent(false, code, false, game) end)
+    return
+  end
+  local keyVal = code
+  pcall(function() if code.Value ~= nil then keyVal = code.Value end end)
+  pcall(function()
+    if keyrelease then keyrelease(keyVal) end
+  end)
+end
+
+local TAP_KEYS = { R = Enum.KeyCode.R, G = Enum.KeyCode.G,
+  C = Enum.KeyCode.C, X = Enum.KeyCode.X, V = Enum.KeyCode.V }
+
+local function tapPc(skillKey)
+  if skillKey == "M1" then
+    vimClick()
+  elseif skillKey == "M2" then
+    vimRightClick()
+  else
+    local code = TAP_KEYS[skillKey]
+    if code ~= nil then
+      keyDown(code)
+      task.wait(0.15)
+      keyUp(code)
+    end
+  end
+end
+
+-- single tap through touch buttons (mobile) or keys (PC). honors the
+-- Farm multi-select. Common-stand toggle skips V. never throws.
+local function doTapSkill(skillKey)
+  if not Flags.Skills[skillKey] then return end
+  if skillKey == "V" and Flags.NoV then
+    say("Skill: V skipped (Common stand)")
+    return
+  end
+  local btn = findMobileButton(skillKey)
+  if btn ~= nil then
+    if tapButton(btn) then
+      say("Skill: " .. skillKey .. " (touch)")
       return
     end
-    local keyVal = code
-    pcall(function() if code.Value ~= nil then keyVal = code.Value end end)
-    pcall(function()
-      if keyrelease then keyrelease(keyVal) end
-    end)
+    say("Skill: " .. skillKey .. " (touch blocked, trying keys)")
+  elseif touchReported then
+    say("Skill: " .. skillKey .. " (no touch button mapped)")
   end
-  if skills.M1 then
-    clickM1()
-    say("Skill: M1 click")
-  end
-  if skills.E then
+  tapPc(skillKey)
+  say("Skill: " .. skillKey)
+end
+
+-- E hold 3s through touch (Ability 1) or key. honors multi-select.
+local function fireEHold()
+  if not Flags.Skills.E then return end
+  local btn = findMobileButton("E")
+  if btn ~= nil then
+    if tapButton(btn, 3) then
+      say("Skill: E hold (3s, touch)")
+    else
+      say("Skill: E hold (touch blocked, trying key)")
+      keyDown(Enum.KeyCode.E)
+      task.wait(3)
+      keyUp(Enum.KeyCode.E)
+      say("Skill: E hold (3s)")
+    end
+  else
     keyDown(Enum.KeyCode.E)
     say("Skill: E hold (3s)...")
     task.wait(3)
     keyUp(Enum.KeyCode.E)
   end
-  local tapOrder = { R = Enum.KeyCode.R, G = Enum.KeyCode.G,
-    C = Enum.KeyCode.C, X = Enum.KeyCode.X, V = Enum.KeyCode.V }
-  for _, key in ipairs({"R", "G", "C", "X", "V"}) do
-    if skills[key] then
-      local code = tapOrder[key]
-      keyDown(code)
-      task.wait(0.15)
-      keyUp(code)
-      say("Skill: " .. tostring(code))
+end
+
+-- visible-but-transparent overlays are not real cooldowns.
+local function overlayShowing(d)
+  local vis = true
+  pcall(function() vis = d.Visible end)
+  if not vis then return false end
+  local seen, opaque = false, false
+  pcall(function()
+    local t = d.BackgroundTransparency
+    if type(t) == "number" then
+      seen = true
+      if t < 0.99 then opaque = true end
+    end
+  end)
+  pcall(function()
+    local t = d.ImageTransparency
+    if type(t) == "number" then
+      seen = true
+      if t < 0.99 then opaque = true end
+    end
+  end)
+  pcall(function()
+    local t = d.TextTransparency
+    if type(t) == "number" then
+      seen = true
+      if t < 0.99 then opaque = true end
+    end
+  end)
+  if not seen then return true end
+  return opaque
+end
+
+-- true when the skill's button shows a cooldown (named overlay, or a
+-- numbered countdown label). static hotbar key numbers are ignored:
+-- only cooldown/timer-ish names count. never throws.
+local function onCooldown(skillKey)
+  local btn = findMobileButton(skillKey)
+  if btn == nil then return false end
+  local cooling = false
+  pcall(function()
+    for _, d in ipairs(btn:GetDescendants()) do
+      local nm = ""
+      pcall(function() nm = string.lower(d.Name or "") end)
+      if nm:find("cooldown", 1, true) then
+        if overlayShowing(d) then
+          local txt = nil
+          pcall(function() txt = d.Text end)
+          local num = tonumber(txt or "")
+          if num == nil or num > 0 then cooling = true end
+        end
+      elseif nm:find("timer", 1, true) or nm:find("remaining", 1, true) or nm:find("counter", 1, true) or nm == "cd" then
+        local txt = nil
+        pcall(function() txt = d.Text end)
+        local num = tonumber(txt or "")
+        if num ~= nil and num > 0 then
+          if overlayShowing(d) then cooling = true end
+        end
+      end
+      if cooling then break end
+    end
+  end)
+  return cooling
+end
+
+-- combo gate: multi-select off or Common-stand V = silent skip,
+-- cooling = skip + log.
+local function comboReady(skillKey)
+  if not Flags.Skills[skillKey] then return false end
+  if skillKey == "V" and Flags.NoV then return false end
+  if onCooldown(skillKey) then
+    say("Combo: " .. skillKey .. " on cooldown, skipping")
+    return false
+  end
+  return true
+end
+
+-- Auto Combo: 3x M1, E hold, 3x M1, R, G (or V), C, X.
+-- cooling skills skip, the rest of the combo keeps going.
+local function runCombo()
+  say("Combo: 3x M1, E hold, 3x M1, R, G/V, C, X (cooling skips)")
+  for i = 1, 3 do
+    if comboReady("M1") then doTapSkill("M1") end
+    task.wait(0.25)
+  end
+  if comboReady("E") then fireEHold() end
+  task.wait(0.3)
+  for i = 1, 3 do
+    if comboReady("M1") then doTapSkill("M1") end
+    task.wait(0.25)
+  end
+  if comboReady("R") then doTapSkill("R") end
+  task.wait(0.2)
+  if comboReady("G") then
+    doTapSkill("G")
+  else
+    local vFire = Flags.Skills.V and not onCooldown("V")
+    if vFire then
+      if Flags.Skills.G then say("Combo: G on cooldown, using V instead") end
+      doTapSkill("V")
+    elseif Flags.Skills.V then
+      say("Combo: V on cooldown, skipping")
     end
   end
+  task.wait(0.2)
+  if comboReady("C") then doTapSkill("C") end
+  task.wait(0.2)
+  if comboReady("X") then doTapSkill("X") end
+  say("Combo: done")
+end
+
+-- skill rotation after each teleport. only fires skills enabled in
+-- Flags.Skills (Farm tab multi-select). on mobile each skill taps its
+-- on-screen button (Punch / Secondary / Ability N, E holds Ability 1);
+-- on PC it fires through VirtualInputManager with mouse1click /
+-- keypress fallbacks. the editor mock has no input service, so it
+-- just logs the rotation. never throws.
+local function useSkills()
+  local any = false
+  for _, k in ipairs(SKILL_LIST) do
+    if Flags.Skills[k] then any = true break end
+  end
+  if not any then
+    say("Skills: none selected, skipping rotation")
+    return
+  end
+  getVim() -- warms input + prints the one-shot status line
+  doTapSkill("M1")
+  doTapSkill("M2")
+  fireEHold()
+  for _, key in ipairs({"R", "G", "C", "X", "V"}) do
+    doTapSkill(key)
+  end
+end
+
+-- rotation entry: combo when the toggle is on, plain rotation otherwise.
+local function fireRotation()
+  if Flags.Combo then
+    runCombo()
+  else
+    useSkills()
+  end
+end
+
+-- increments whenever follow mode must stop (toggle off, Land, new lock).
+local followToken = 0
+
+-- background pin loop: re-teleports above the same NPC root every 0.1s
+-- so a walking NPC can't leave you behind. stops when the token dies.
+local function keepPin(name, myToken, getRp)
+  task.spawn(function()
+    while Flags.NpcFarm and npcTarget == name and followToken == myToken do
+      pinTo(getRp())
+      task.wait(0.1)
+    end
+  end)
+end
+
+-- bosses respawn every 1-3 min, mobs every 15-30s: wait longer on a
+-- missing boss so the loop doesn't spam rescans. never throws.
+local function respawnWait(name)
+  local info = NPC_INFO[name]
+  if info ~= nil and info.boss then return 5 end
+  return 1.5
+end
+
+-- single-target mode: lock one NPC, glue above it, spam the rotation
+-- until it dies/leaves, the target changes, or the toggle goes off.
+local function followTarget(name)
+  local npc = findNpcByName(name)
+  if npc == nil then
+    setStatus("Status: " .. name .. " not found")
+    say("NPC farm: " .. name .. " not found, waiting for spawn...")
+    return 0
+  end
+  followToken = followToken + 1
+  local myToken = followToken
+  say("Locked onto " .. name .. " - following + skill spam (toggle off or Land to stop)")
+  setStatus("Status: locked " .. name)
+  keepPin(name, myToken, function()
+    if npc == nil then return nil end
+    return rootPartOf(npc)
+  end)
+  local cycles = 0
+  while Flags.NpcFarm and npcTarget == name and followToken == myToken do
+    if npc == nil or not isAlive(npc) then
+      say("NPC farm: " .. name .. " down or gone - rescanning...")
+      npc = findNpcByName(name)
+      if npc == nil then
+        task.wait(respawnWait(name))
+        if Flags.NpcFarm and npcTarget == name then
+          npc = findNpcByName(name)
+        end
+        if npc == nil then break end
+      end
+    else
+      cycles = cycles + 1
+      fireRotation()
+      task.wait(0.3)
+    end
+  end
+  if farmCount then
+    pcall(function() farmCount:Set("NPCs: " .. (cycles > 0 and 1 or 0)) end)
+  end
+  say("Unlocked " .. name .. " (" .. cycles .. " rotations)")
+  return cycles > 0 and 1 or 0
+end
+
+-- one teleport + one rotation, no loop (Go button / single sweep hit).
+local function visitOnce(name)
+  local hrp = getPlayerHRP()
+  if hrp == nil then
+    setStatus("Status: waiting for character...")
+    say("NPC farm: no character yet")
+    return 0
+  end
+  local npc = findNpcByName(name)
+  if npc == nil then
+    say("NPC farm: " .. name .. " not found, skipping")
+    return 0
+  end
+  if not isAlive(npc) then
+    say("NPC farm: " .. name .. " down, skipping")
+    return 0
+  end
+  local rp = rootPartOf(npc)
+  if rp == nil or rp.Position == nil then
+    say("NPC farm: " .. name .. " has no position, skipping")
+    return 0
+  end
+  pinTo(rp)
+  task.wait(0.25)
+  setStatus("Status: " .. modeLabel() .. " " .. name)
+  say("Hovering " .. modeLabel() .. " " .. name .. " (pinned)")
+  fireRotation()
+  task.wait(0.5)
+  return 1
 end
 
 -- one pass over the current NPC target. returns npcs visited.
@@ -279,6 +820,13 @@ local function farmNpcsOnce()
     setStatus("Status: waiting for character...")
     say("NPC farm: no character yet")
     return 0
+  end
+  -- single target: lock + follow while the toggle is on, one visit for Go.
+  if npcTarget ~= "All" then
+    if Flags.NpcFarm then
+      return followTarget(npcTarget)
+    end
+    return visitOnce(npcTarget)
   end
   local targets = {}
   if npcTarget == "All" then
@@ -296,19 +844,14 @@ local function farmNpcsOnce()
     else
       local rp = rootPartOf(npc)
       if rp and rp.Position then
-        -- hover above the NPC, pinned + pitched 90 degrees so the player
-        -- looks straight down. anchored = no falling between teleports;
-        -- stand skills fire downward into the NPC.
-        pcall(function()
-          hrp.CFrame = CFrame.new(rp.Position.X, rp.Position.Y + Flags.NpcHeight, rp.Position.Z)
-            * CFrame.Angles(math.rad(-90), 0, 0)
-        end)
-        setFloat(true)
+        -- hover at the chosen float pose, pinned so there is no falling
+        -- between teleports.
+        pinTo(rp)
         task.wait(0.25)
         visited = visited + 1
-        setStatus("Status: above " .. name .. " (" .. visited .. ")")
-        say("Hovering above " .. name .. " (pinned, looking down 90 deg)")
-        useSkills()
+        setStatus("Status: " .. modeLabel() .. " " .. name .. " (" .. visited .. ")")
+        say("Hovering " .. modeLabel() .. " " .. name .. " (pinned)")
+        fireRotation()
         task.wait(0.5)
       end
     end
@@ -433,7 +976,7 @@ local FarmTab = Window:AddTab("Farm", "sprout")
 farmStatus = FarmTab:AddLabel("Status: idle", "activity")
 farmCount = FarmTab:AddLabel("NPCs: 0", "trophy")
 
-FarmTab:AddToggle({
+farmToggle = FarmTab:AddToggle({
   Title    = "Farm NPCs",
   Subtitle = "Teleports above each target NPC",
   Icon     = "swords",
@@ -441,6 +984,7 @@ FarmTab:AddToggle({
   Callback = function(state)
     Flags.NpcFarm = state
     if not state then
+      followToken = followToken + 1
       setFloat(false)
     end
     say("NPC farm " .. (state and "enabled" or "disabled"))
@@ -448,15 +992,16 @@ FarmTab:AddToggle({
   end,
 })
 
-FarmTab:AddDropdown({
+npcDropdown = FarmTab:AddDropdown({
   Title   = "Target NPC",
   Icon    = "crosshair",
-  Options = {"All", "Slugger", "Criminal", "Corrupt Cop", "Capo", "Mobster",
-    "Vampire Capo", "Vampire Mobster", "Pillar Man", "Sewer Pillar Man",
-    "Elite Pillar Man", "Esidisi", "Straizo", "Banks",
-    "Thug", "Strong Thug", "Evil Vampire", "Slightly More Eviler Vampire",
-    "Speedwagon Gang Member", "Bruford", "Tarkus",
-    "Desert Bandit", "Bandit Captain", "Chaka", "King of the Thugs"},
+  Options = {"All", "Thug", "Speedwagon Gang Member", "Strong Thug",
+    "King of the Thugs", "Tarkus", "Evil Vampire",
+    "Slightly More Eviler Vampire", "Bruford", "Criminal", "Slugger",
+    "Corrupt Cop", "Mobster", "Capo", "Banks",
+    "Vampire Mobster", "Vampire Capo", "Sewer Pillar Man", "Straizo",
+    "Pillar Man", "Elite Pillar Man", "Esidisi",
+    "Desert Bandit", "Bandit Captain", "Chaka"},
   Default = 1,
   Callback = function(selected)
     if type(selected) == "number" then
@@ -468,18 +1013,44 @@ FarmTab:AddDropdown({
     else
       npcTarget = selected
     end
-    say("NPC target: " .. npcTarget)
+    if npcTarget == "All" then
+      say("NPC target: All (sweeps weakest -> strongest)")
+    else
+      local info = NPC_INFO[npcTarget]
+      local wantH = 6
+      if info ~= nil and info.ranged then wantH = 12 end
+      Flags.NpcHeight = wantH
+      pcall(function() if heightSlider then heightSlider:Set(wantH) end end)
+      say("NPC target: " .. npcTip(npcTarget) .. " (hover auto-set " .. wantH .. ")")
+    end
   end,
 })
 
-FarmTab:AddSlider({
+heightSlider = FarmTab:AddSlider({
   Title    = "Hover Height",
-  Subtitle = "Studs above the NPC",
+  Subtitle = "Studs offset (auto-set on target pick, adjustable)",
   Icon     = "arrow-up",
   Min      = 2,
   Max      = 20,
   Default  = 5,
   Callback = function(value) Flags.NpcHeight = value end,
+})
+
+FarmTab:AddDropdown({
+  Title   = "Float Position",
+  Icon    = "move",
+  Options = {"Above", "Behind (3 studs)", "Below"},
+  Default = 1,
+  Callback = function(selected)
+    if selected == 2 or selected == "Behind (3 studs)" or selected == "Behind" then
+      floatPos = "Behind"
+    elseif selected == 3 or selected == "Below" then
+      floatPos = "Below"
+    else
+      floatPos = "Above"
+    end
+    say("Float position: " .. modeLabel())
+  end,
 })
 
 FarmTab:AddButton({
@@ -502,9 +1073,25 @@ FarmTab:AddButton({
   Text     = "Land",
   Callback = function()
     Flags.NpcFarm = false
+    followToken = followToken + 1
     setFloat(false)
+    pcall(function() if farmToggle then farmToggle:Set(false) end end)
     say("Landed - physics back to normal")
     setStatus("Status: stopped")
+  end,
+})
+
+FarmTab:AddButton({
+  Title    = "Test Skills (no teleport)",
+  Subtitle = "Fires where you stand - respects the Auto Combo toggle",
+  Icon     = "flask",
+  Text     = "Test",
+  Callback = function()
+    task.spawn(function()
+      say("Skill test: firing in place...")
+      fireRotation()
+      say("Skill test done - if nothing fired, read the Input: line above")
+    end)
   end,
 })
 
@@ -513,13 +1100,14 @@ FarmTab:AddLabel("Skills (multi-select): only checked skills fire", "zap")
 
 local skillToggles = {}
 local skillDefs = {
-  { Key = "M1", Title = "Skill: M1 (left click)", Subtitle = "Left mouse click" },
-  { Key = "E", Title = "Skill: E (hold 3s)", Subtitle = "Hold, then release" },
-  { Key = "R", Title = "Skill: R", Subtitle = "Tap" },
-  { Key = "G", Title = "Skill: G", Subtitle = "Tap" },
-  { Key = "C", Title = "Skill: C", Subtitle = "Tap" },
-  { Key = "X", Title = "Skill: X", Subtitle = "Tap" },
-  { Key = "V", Title = "Skill: V", Subtitle = "Tap" },
+  { Key = "M1", Title = "Skill: M1 / Punch (LMB combo)", Subtitle = "Tap" },
+  { Key = "M2", Title = "Skill: M2 / Secondary (double RMB)", Subtitle = "Tap x2" },
+  { Key = "E", Title = "Skill: E / Ability 1 Barrage (hold 3s)", Subtitle = "Hold, then release" },
+  { Key = "R", Title = "Skill: R / Ability 2 Heavy breaker", Subtitle = "Tap" },
+  { Key = "G", Title = "Skill: G / Ability 3 Signature", Subtitle = "Tap" },
+  { Key = "C", Title = "Skill: C / Ability 4 Mobility", Subtitle = "Tap" },
+  { Key = "X", Title = "Skill: X / Ability 5 Special", Subtitle = "Tap" },
+  { Key = "V", Title = "Skill: V / Ability 6 Ultimate", Subtitle = "Tap" },
 }
 for _, def in ipairs(skillDefs) do
   local key = def.Key
@@ -567,7 +1155,29 @@ FarmTab:AddButton({
   end,
 })
 
-FarmTab:AddLabel("Aim: pinned hover + pitch 90 deg, looking straight down so stand skills hit", "crosshair")
+FarmTab:AddToggle({
+  Title    = "Auto Combo",
+  Subtitle = "3x M1, E hold, 3x M1, R, G/V, C, X - cooling skips, Commons have no V",
+  Icon     = "swords",
+  Default  = false,
+  Callback = function(state)
+    Flags.Combo = state
+    say("Auto Combo " .. (state and "on: 3xM1 E-hold 3xM1 R G/V C X" or "off: plain rotation"))
+  end,
+})
+
+FarmTab:AddToggle({
+  Title    = "Common Stand (no V)",
+  Subtitle = "Skips V - Sun/Emperor have no Ultimate",
+  Icon     = "slash",
+  Default  = false,
+  Callback = function(state)
+    Flags.NoV = state
+    say("Common stand " .. (state and "on: V skipped" or "off: V fires"))
+  end,
+})
+
+FarmTab:AddLabel("Aim: pinned hover, facing the NPC. single target locks + follows. ranged/AoE (Tarkus, Bruford, guns, Banks, Straizo, Esidisi): hover 10-15. melee: hover 5-8. E = barrage hold, R = breaker, G = signature, C = mobility, X = special, V = ultimate", "crosshair")
 
 -- chest tab config (used only by the Chests tab below)
 Flags.Auto = false
@@ -739,17 +1349,28 @@ dropToggle = DropsTab:AddToggle({
   end,
 })
 
-DropsTab:AddLabel("Full drop logic lives in the Drops module - this switch only signals it.", "info")
+DropsTab:AddLabel("Bosses: small chance 2 arrows / 1 shiny / 2 locacaca. Tarkus: arrow + roka. Esidisi: no drops, domain pays.", "trophy")
+DropsTab:AddLabel("Domains: Dio castle (Pluck, 10+, 2000g) = Stone Mask. Hamon (Yacht, 21+, 7500g) = Scarf. Arena (invite, 30+, 44k) = Red Stone. Misty (40+, 75k) = Cursed Hilt.", "key")
+DropsTab:AddLabel("Chests (hold E): one reward each - arrow, locacaca, gold or shiny. each chest its own 1h timer. golden = one-time.", "package")
+DropsTab:AddLabel("Arrows: dailies/butler (specialized = 5 tokens), bounty 2pts (shiny 8), codes, domains, John G. Legend quest. pity: shiny/legendary every 20 arrows.", "gift")
+DropsTab:AddLabel("Roka resets stand/spec (keeps level/gold/stored): chests, bounty shop, domains, butler tokens.", "apple")
 
 local IntelTab = Window:AddTab("Intel", "book")
 
-IntelTab:AddLabel("Best farms from the real drop tables:", "info")
-IntelTab:AddLabel("Arrows: Tarkus 33% (boss, London) - Bruford 10% (boss, London)", "trophy")
-IntelTab:AddLabel("Arrows: Straizo 5% (boss, NY) - Banks 9% (boss, NY)", "trophy")
-IntelTab:AddLabel("Fruit: Tarkus 33% - Bruford 10% - Banks 10%", "apple")
-IntelTab:AddLabel("Guaranteed Gem: King of the Thugs 100% (boss, Cairo)", "gem")
-IntelTab:AddLabel("Cash: Shadow Monarch 25k - King of the Thugs 15k", "cash")
-IntelTab:AddLabel("XP: Kars ULF 7500 - Corrupt Polanreff / Avdol 3200", "star")
+IntelTab:AddLabel("Route: London 1-12 -> NY + Sewers 12-28 -> Hamon 21+ -> Desert 30+ -> Cairo/Misty 40+", "info")
+IntelTab:AddLabel("Order: Thug -> Strong Thug -> King -> Tarkus -> Vampires -> Bruford -> NY streets -> Docks -> Banks -> Sewers -> Straizo -> Hamon -> Esidisi -> Desert -> Chaka", "star")
+IntelTab:AddLabel("Hover high 10-15: guns, Banks, Straizo, Esidisi, vamp Rage Blast, Pillar leaps. else 5-8", "move")
+IntelTab:AddLabel("Keys: Banks 419 = Yacht Keys. Bruford = Pluck sword (Dio castle 10+, 2000g). Straizo = arena invite (30+, 44k)", "key")
+IntelTab:AddLabel("Esidisi: 600 HP (900 nightmare) +150/player. Bloodbath pull = perfect-block only. no drops, domain pays", "swords")
+IntelTab:AddLabel("Hamon levers: Green->Pink->Yellow->Blue->Red. Zigzag = 3 Pillar + 1 Elite, then Esidisi", "list-ordered")
+IntelTab:AddLabel("Specs: Stone Mask->Vamp, Scarf->Hamon, Red Stone+Vamp->ULF, Cursed Hilt->Anubis Chariot. Commons (Sun/Emperor) have no V", "zap")
+IntelTab:AddLabel("Spawns: mobs groups of 3-5, 15-30s. bosses 1 at a time, 1-3 min. domains reset on re-entry", "timer")
+IntelTab:AddLabel("Repeatable: Busy Businessman (London, by Dio castle) wants 3 Vampires + 1 Strong Vampire. grab the giver by your farm spot", "repeat")
+IntelTab:AddLabel("London sides: John G. Legend = free arrow. Grieving Mother = Student ID from Evil Vamps", "gift")
+IntelTab:AddLabel("Controls: hold F block, tap F parry (beats Bloodbath), Ctrl dash, Shift shift-lock aim. R breaks guards", "gamepad")
+IntelTab:AddLabel("Storage: Dio storyline unlocks Stand Storage. unused Specialized Arrows = free extra storage", "box")
+IntelTab:AddLabel("Codes: Menu > Settings/Stats > Codes box (case-sensitive, most need Lv 10-25). check Discord", "ticket")
+IntelTab:AddLabel("Geb: Corrupt Ruins quest - 3 Purified Water + arrow + 50k gold = Purified Arrow", "droplet")
 
 local AboutTab = Window:AddTab("About", "heart")
 AboutTab:AddLabel("Join us, its a small or maybe a server with 1-2 people it would be nice if you joined")
