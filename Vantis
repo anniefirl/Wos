@@ -1723,20 +1723,25 @@ end
 
 -- cached bag button: full PlayerGui scans on every refresh are the biggest
 -- self-inflicted lag spike in the drop loop, so resolve once and reuse
--- while it stays alive (60s TTL, alive check guards HUD rebuilds).
+-- while it stays alive (hit TTL 60s, miss TTL 5s so a renamed button is
+-- retried instead of being stuck on Visible-flip forever).
 local invToggleCache = nil
 local invToggleCacheAt = 0
 local function getInvToggle()
-  -- a cached miss (nil) is valid too: without this a missing button would
-  -- rescan all of PlayerGui on every refresh.
-  if invToggleCacheAt > 0 and tick() - invToggleCacheAt < 60 then
-    local b = invToggleCache
-    if b == nil then return nil end
-    local alive = false
-    pcall(function()
-      alive = b.Parent ~= nil
-    end)
-    if alive then return b end
+  if invToggleCacheAt > 0 then
+    local age = 0
+    pcall(function() age = tick() - invToggleCacheAt end)
+    local ttl = 60
+    if invToggleCache == nil then ttl = 5 end
+    if age < ttl then
+      local b = invToggleCache
+      if b == nil then return nil end
+      local alive = false
+      pcall(function()
+        alive = b.Parent ~= nil
+      end)
+      if alive then return b end
+    end
   end
   local b = findInventoryToggle()
   invToggleCache = b
@@ -1788,12 +1793,34 @@ local function vuClick(btn)
   return sent
 end
 
+-- fallback bag open: many games toggle the bag on B / Tab / I / M. tries
+-- each key and stops as soon as the frame reads open. never throws.
+local function pressBagKeys()
+  for _, kc in ipairs({Enum.KeyCode.B, Enum.KeyCode.Tab, Enum.KeyCode.I, Enum.KeyCode.M}) do
+    pcall(function() keyDown(kc) end)
+    task.wait(0.08)
+    pcall(function() keyUp(kc) end)
+    local g = getInvFrame()
+    if g ~= nil then
+      local open = false
+      pcall(function() open = isGuiOpen(g) end)
+      if open then
+        say("Bag opened (key)")
+        return true
+      end
+    end
+  end
+  return false
+end
+
 -- drives the bag to a real open/closed state through the game's OWN button:
 -- signal click first (free when the executor supports it), verify, then a
--- real VIM click when the state did not move, verify, then the Visible
--- flip as last resort. logs which path worked so the log shows whether
--- the bag actually moves in-game. never throws. returns true if the bag
--- is in the asked state.
+-- real VIM click when the state did not move, then keybinds (B/Tab/I/M),
+-- then the Visible flip as last resort. a never-opened bag may have NO
+-- frame at all, so the button + keys are tried even when getInvFrame()
+-- is nil (the old code gave up on a nil frame). logs which path worked so
+-- the log shows whether the bag actually moves in-game. never throws.
+-- returns true if the bag is in the asked state.
 local function setBagOpen(open)
   local function isOpen()
     local g = getInvFrame()
@@ -1818,26 +1845,41 @@ local function setBagOpen(open)
       end
       say("Bag " .. (open and "open" or "close") .. " did not move - check Scan GUI for the real button name")
     end
-  else
-    local gui = getInvFrame()
-    if gui ~= nil then
-      setGuiOpen(gui, open)
-      task.wait(0.1)
-      invFrameCache = nil
-    end
+  end
+  if open then
+    -- the frame may not exist until the first real open, so keys are tried
+    -- before giving up (they create the frame in most games).
+    invFrameCache = nil
+    pcall(function() pressBagKeys() end)
+    invFrameCache = nil
+    if isOpen() == open then return true end
+  end
+  local gui = getInvFrame()
+  if gui ~= nil then
+    setGuiOpen(gui, open)
+    task.wait(0.1)
+    invFrameCache = nil
   end
   return isOpen() == open
 end
 
 local function openInventory()
-  if setBagOpen(true) then
-    local gui = getInvFrame()
-    if gui ~= nil and isGuiOpen(gui) then
-      bagPrimed = true
-      setStatus("Status: inventory open")
-      say("Inventory opened")
-      return true
+  -- GUI FIRST: retry the real open up to 3 times (button rescan each try,
+  -- so a renamed button is picked up). the drop loop must never scan
+  -- before this succeeds, or it reads an empty list and idles forever.
+  for attempt = 1, 3 do
+    if setBagOpen(true) then
+      local gui = getInvFrame()
+      if gui ~= nil and isGuiOpen(gui) then
+        bagPrimed = true
+        setStatus("Status: inventory open")
+        say("Inventory opened")
+        return true
+      end
     end
+    invFrameCache = nil
+    invToggleCacheAt = 0 -- force a fresh button scan on the next attempt
+    task.wait(0.15)
   end
   -- last resort: force Visible even if the game disagrees, then continue.
   local gui = getInvFrame()
@@ -1863,10 +1905,10 @@ local function refreshInventory()
   return setBagOpen(true)
 end
 
--- Drop spot: while auto drop runs, the player is frozen here, standing upright.
--- (Pitching the root part lays the whole rig flat, which left the character
--- positioned wrong - so the character stands and the camera looks down instead.)
+-- Drop spot: while auto drop runs, the player is frozen here pitched
+-- 35 degrees (user asked: rotate the PLAYER 35 deg, not just the camera).
 local DropSpotX, DropSpotY, DropSpotZ = 298, 17, 207
+local DROP_PITCH_DEG = 35
 
 local function zeroMotion(hrp)
   pcall(function()
@@ -1880,18 +1922,64 @@ local function zeroMotion(hrp)
 end
 
 local function dropSpotCFrame()
-  return CFrame.new(DropSpotX, DropSpotY, DropSpotZ)
+  local pitch = 0
+  pcall(function() pitch = math.rad(-DROP_PITCH_DEG) end)
+  local cf = CFrame.new(DropSpotX, DropSpotY, DropSpotZ)
+  local rot = nil
+  pcall(function() rot = CFrame.Angles(pitch, 0, 0) end)
+  if cf ~= nil and rot ~= nil then
+    local composed = nil
+    pcall(function() composed = cf * rot end)
+    if composed ~= nil then return composed end
+  end
+  return cf
 end
 
--- seconds between forced re-pins during a sustained drift. Pin once, then
--- hold the anchor: machine-gun teleporting against a server pull is what
--- gets players kicked (looks like a crash after a while).
+-- seconds between forced re-pins during a sustained drift. the anchor is
+-- re-asserted EVERY cycle (cheap); only the teleport itself is throttled,
+-- so a server pull never turns into a fall.
 local lastPinTime = 0
+
+-- PlatformStand stops the humanoid controller from fighting the anchor
+-- (that fight is what reads as "falls down instead of staying").
+local function setDropPlatform(on)
+  pcall(function()
+    local hum = getHumanoid()
+    if hum ~= nil then
+      hum.PlatformStand = on
+      if on then hum.Sit = false end
+    end
+  end)
+end
+
+-- anchor the whole rig, not just the root: one unanchored limb in a
+-- physics step can drag the assembly down even with an anchored HRP.
+local function anchorChar(on)
+  pcall(function()
+    local char = nil
+    if LP then char = LP.Character end
+    if char == nil then return end
+    for _, d in ipairs(char:GetDescendants()) do
+      local ok = false
+      pcall(function()
+        if d.IsA then ok = d:IsA("BasePart") end
+      end)
+      if not ok then
+        pcall(function()
+          local cn = d.ClassName
+          ok = cn == "Part" or cn == "MeshPart"
+        end)
+      end
+      if ok then pcall(function() d.Anchored = on end) end
+    end
+  end)
+end
 
 -- full freeze, skipped when already placed+anchored: unanchor FIRST (a CFrame
 -- set on an already-anchored part does not always replicate, so the server
--- snaps the character back), kill all velocity, double-set the standing
--- CFrame, then anchor. camera looks down at the drop pile.
+-- snaps the character back), kill all velocity, double-set the pitched
+-- 35-degree CFrame, then anchor the whole rig + PlatformStand. camera
+-- looks down at the drop pile.
 local function freezeAtDropSpot()
   local hrp = chestHRP()
   if not hrp then return nil end
@@ -1905,15 +1993,39 @@ local function freezeAtDropSpot()
   end)
   if placed then
     lastPinTime = tick()
+    pcall(function() hrp.Anchored = true end)
+    anchorChar(true)
+    setDropPlatform(true)
     return hrp
   end
+  -- stand up first: a seat weld drags the character back after the teleport.
+  pcall(function()
+    local hum = getHumanoid()
+    if hum ~= nil and hum.SeatPart ~= nil then hum.Sit = false end
+  end)
+  task.wait(0.05)
+  setNoclip(true)
+  setDropPlatform(true)
   pcall(function() hrp.Anchored = false end)
+  anchorChar(false)
   zeroMotion(hrp)
+  pcall(function()
+    local char = LP and LP.Character or nil
+    if char ~= nil then
+      for _, d in ipairs(char:GetDescendants()) do
+        pcall(function()
+          d.AssemblyLinearVelocity = Vector3.zero
+          d.AssemblyAngularVelocity = Vector3.zero
+        end)
+      end
+    end
+  end)
   pcall(function() hrp.CFrame = dropSpotCFrame() end)
   task.wait(0.05)
   pcall(function() hrp.CFrame = dropSpotCFrame() end)
   zeroMotion(hrp)
   pcall(function() hrp.Anchored = true end)
+  anchorChar(true)
   lastPinTime = tick()
   pcall(function()
     local cam = workspace.CurrentCamera
@@ -1926,29 +2038,45 @@ local function freezeAtDropSpot()
   return hrp
 end
 
--- light maintenance between drops: only re-teleport when drifted more than
--- 2.5 studs (no more constant teleport spam), always hold the anchor.
+-- light maintenance between drops: ALWAYS re-assert the hold (anchor the
+-- whole rig + PlatformStand + kill fall velocity), only the teleport is
+-- throttled. a hard fall (Y well under the spot) re-pins immediately,
+-- ignoring the throttle, so the player never slides to the ground.
 local function holdDropSpot()
   pcall(function()
     local hrp = chestHRP()
     if not hrp then return end
+    setDropPlatform(true)
+    -- kill any fall speed first: an anchored part with leftover velocity
+    -- can still be flung on the next physics step.
+    local vy = 0
+    pcall(function()
+      local v = hrp.AssemblyLinearVelocity or hrp.Velocity
+      if v ~= nil and v.Y ~= nil then vy = v.Y end
+    end)
+    if vy < -5 then zeroMotion(hrp) end
     local drifted = true
+    local fell = false
     pcall(function()
       local p = hrp.Position
       local dx = p.X - DropSpotX
       local dy = p.Y - DropSpotY
       local dz = p.Z - DropSpotZ
       drifted = math.sqrt(dx * dx + dy * dy + dz * dz) > 2.5
+      fell = (DropSpotY - p.Y) > 4
     end)
-    if drifted then
+    if fell or drifted then
       local now = tick()
-      if now - lastPinTime > 3 then
+      if fell or (now - lastPinTime > 1.5) then
         lastPinTime = now
+        pcall(function() hrp.Anchored = false end)
         zeroMotion(hrp)
-        hrp.CFrame = dropSpotCFrame()
+        pcall(function() hrp.CFrame = dropSpotCFrame() end)
+        zeroMotion(hrp)
       end
     end
-    hrp.Anchored = true
+    pcall(function() hrp.Anchored = true end)
+    anchorChar(true)
   end)
 end
 
@@ -1957,15 +2085,24 @@ local function unfreezeNow()
     local hrp = chestHRP()
     if hrp then hrp.Anchored = false end
   end)
+  anchorChar(false)
+  setDropPlatform(false)
+  -- don't fight the farm's noclip: only restore collisions when the farm
+  -- itself is off.
+  if not Flags.NpcFarm then setNoclip(false) end
 end
 
 -- Drop All: priority order, click each item then drop until its count is 0.
 local DropOrder = {"Legendary Arrow", "Shiny Arrow", "Stand Arrow", "Locacaca Fruit"}
 
 -- clicks a GuiButton the way a real click does: fire EVERY signal the game
--- could listen on (down + click + activated + connections + Activate).
--- turbo-safe: this is exactly what an auto-clicker does, and rapid real
--- clicks were validated in-game (no crash, counts stay correct).
+-- could listen on (down + click + activated + connections + Activate) PLUS
+-- a real VIM click at the button's screen center. silent signal-only input
+-- is what made slots/Drop/Conform miss in-game on games wired to
+-- MouseButton1Click without firesignal support: Activate() alone never
+-- reaches them, so a real click lands no matter which connection the game
+-- used. turbo-safe: this is exactly what an auto-clicker does, and rapid
+-- real clicks were validated in-game (no crash, counts stay correct).
 -- never throws. returns true if anything was attempted.
 clickGui = function(btn)
   if btn == nil then return false end
@@ -2009,6 +2146,16 @@ clickGui = function(btn)
     if typeof(firesignal) == "function" and btn.Activated then
       firesignal(btn.Activated)
       clicked = true
+    end
+  end)
+  -- real click at the button center: reaches games that ignore silent
+  -- signal input entirely. guarded to real buttons (Tools share an
+  -- Activate method that would USE the tool instead of selecting it).
+  pcall(function()
+    local cls = nil
+    pcall(function() cls = btn.ClassName end)
+    if cls == "TextButton" or cls == "ImageButton" then
+      if vuClick and vuClick(btn) then clicked = true end
     end
   end)
   return clicked
@@ -2293,12 +2440,18 @@ local function findDropButtonIn(container, exceptBtn, preAll)
 end
 
 local function findDropButton(exceptBtn, preFrame, preAll)
-  -- frame-only when the frame exists (a stray global "Drop" from another
-  -- menu used to shadow the real one, and scanning all of PlayerGui as a
-  -- fallback on every attempt is what lagged the game out).
+  -- frame first (a stray global "Drop" from another menu used to shadow the
+  -- real one), then ONE PlayerGui sweep: Drop/Conform popups often live
+  -- OUTSIDE the inventory frame, and frame-only search is what read as
+  -- "no Drop button" forever in-game.
   if preFrame then
     local b = findDropButtonIn(preFrame, exceptBtn, preAll)
     if b then return b end
+    local pg = getPlayerGui()
+    if pg and pg ~= preFrame then
+      b = findDropButtonIn(pg, exceptBtn)
+      if b then return b end
+    end
     return nil
   end
   local frame = getInvFrame()
@@ -2362,6 +2515,13 @@ local function findConfirmButton(exceptBtn, preFrame, preAll)
   if preFrame then
     local b = findConfirmButtonIn(preFrame, exceptBtn, preAll)
     if b then return b end
+    -- same outside-the-frame case as Drop: the popup is often a sibling of
+    -- the bag, not a child of it.
+    local pg = getPlayerGui()
+    if pg and pg ~= preFrame then
+      b = findConfirmButtonIn(pg, exceptBtn)
+      if b then return b end
+    end
     return nil
   end
   local frame = getInvFrame()
@@ -2451,6 +2611,19 @@ end
 -- PlayerGui walks per attempt (that scan spam is what lagged the game).
 -- never throws.
 
+-- Backspace is the game's keyboard drop path: when the Drop button can't
+-- be found (custom UI, renamed button), one Backspace often drops the
+-- selected slot without any button. never throws.
+local function pressBackspace()
+  local code = nil
+  pcall(function() code = Enum.KeyCode.Backspace end)
+  if code == nil then return false end
+  pcall(function() keyDown(code) end)
+  task.wait(0.1)
+  pcall(function() keyUp(code) end)
+  return true
+end
+
 -- ONE spam cycle for a single item: slot -> Drop -> Conform, exactly one
 -- unit. no rebuild inside (the caller batches those). returns "fired" (a
 -- Conform press went out), "nosuch" (nothing by that name right now),
@@ -2458,29 +2631,37 @@ end
 local function dropUnitOnce(itemName, myToken)
   if cancelledDrop(myToken) then return "stopped" end
   holdDropSpot()
-  -- Multidrop toggle: tighter waits + shorter confirm window.
+  -- Multidrop toggle: tighter waits + shorter confirm window. normal waits
+  -- were raised slightly (0.05->0.08 click, 0.05->0.08 poll) because laggy
+  -- servers never registered the old turbo beats and items read as stuck.
   local fast = Flags.MultiDrop and true or false
-  local wClick = fast and 0.01 or 0.05
-  local wSettle = fast and 0.03 or 0.1
+  local wClick = fast and 0.03 or 0.08
+  local wSettle = fast and 0.06 or 0.15
   local pollN = fast and 12 or 30
-  local pollW = fast and 0.03 or 0.05
+  local pollW = fast and 0.05 or 0.08
+  local function isGuiSlot(n)
+    if n == nil then return false end
+    local cls = nil
+    pcall(function() cls = n.ClassName end)
+    return cls == "TextButton" or cls == "ImageButton"
+      or cls == "Frame" or cls == "ImageLabel" or cls == "TextLabel"
+  end
+  -- GUI slot first (many games only show Drop for the GUI-selected slot),
+  -- then the held tool: selecting in the GUI + equipping covers both UI
+  -- styles. the old equip-only path never selected the GUI row, so Drop
+  -- never appeared for backpack-held items.
+  local frame0, snap0 = snapshotFrame()
+  local guiSlot = nil
+  if frame0 then guiSlot = findItemSlotIn(frame0, itemName, snap0)
+  else guiSlot = findItemSlot(itemName) end
   local tool = findHeldTool(itemName)
-  local slot = nil
-  if tool then
-    slot = tool
-  else
-    local frame0, snap0 = snapshotFrame()
-    local gs = nil
-    if frame0 then
-      gs = findItemSlotIn(frame0, itemName, snap0)
-    else
-      gs = findItemSlot(itemName)
-    end
-    if not gs then return "nosuch" end
-    slot = gs
+  if guiSlot == nil and tool == nil then return "nosuch" end
+  local slot = guiSlot or tool
+  if guiSlot then
+    clickGui(guiSlot)
+    task.wait(wClick)
   end
   if tool then
-    -- equip it so the Drop button has something to drop
     pcall(function()
       local char = LP.Character
       local hum = nil
@@ -2488,12 +2669,9 @@ local function dropUnitOnce(itemName, myToken)
         if char.FindFirstChildOfClass then hum = char:FindFirstChildOfClass("Humanoid")
         else hum = char:FindFirstChild("Humanoid") end
       end
-      if hum and hum.EquipTool then hum:EquipTool(slot) end
+      if hum and hum.EquipTool then hum:EquipTool(tool) end
     end)
-    task.wait(fast and 0.05 or 0.15)
-  else
-    clickGui(slot)
-    task.wait(wClick)
+    task.wait(fast and 0.08 or 0.15)
   end
   if cancelledDrop(myToken) then return "stopped" end
   -- leftover confirmation first, then Drop + a fast poll for the popup.
@@ -2510,14 +2688,35 @@ local function dropUnitOnce(itemName, myToken)
   if not dropBtn then
     -- one re-tap: selection can lag a beat behind the slot press on a busy
     -- server. only a missing button after TWO taps counts as stuck, so a
-    -- real item is never condemned on one slow frame.
-    clickGui(slot)
-    task.wait(wClick)
+    -- real item is never condemned on one slow frame. re-tap is GUI-only:
+    -- tapping a Tool would ACTIVATE (use) it instead of selecting.
+    if isGuiSlot(slot) then
+      clickGui(slot)
+      task.wait(wClick)
+    else
+      task.wait(wClick)
+    end
     local frameB2, snapB2 = snapshotFrame()
     dropBtn = findDropButton(nil, frameB2, snapB2)
-    if not dropBtn then return "stuck" end
+    if not dropBtn then
+      -- keyboard path: Backspace drops the selected slot with no button.
+      -- if a confirm pops from it, press it and count the unit.
+      pressBackspace()
+      task.wait(wClick)
+      local frameBk = getInvFrame()
+      local bkConfirm = findConfirmFast(frameBk, nil)
+      if not bkConfirm then bkConfirm = findConfirmButton(nil, frameBk, nil) end
+      if bkConfirm then
+        clickGui(bkConfirm)
+        say("Conform pressed for " .. itemName .. " (backspace)")
+        task.wait(wSettle)
+        return "fired"
+      end
+      return "stuck"
+    end
   end
   clickGui(dropBtn)
+  say("Drop pressed for " .. itemName)
   task.wait(wClick)
   -- some games morph the SAME button into the confirm step:
   -- if it now reads conform/confirm, press it again directly.
@@ -2554,6 +2753,23 @@ local function dropUnitOnce(itemName, myToken)
     say("Conform pressed for " .. itemName)
     task.wait(wSettle)
     return "fired"
+  end
+  -- no popup after a real Drop press: try the keyboard path once before
+  -- calling it stuck (some confirm popups only listen to keys). still
+  -- "stuck" if nothing appears - the caller retries, it just takes longer
+  -- to condemn a real item now.
+  pressBackspace()
+  task.wait(pollW)
+  do
+    local frameK = getInvFrame()
+    local kb = findConfirmFast(frameK, dropBtn)
+    if not kb then kb = findConfirmButton(dropBtn, frameK, nil) end
+    if kb then
+      clickGui(kb)
+      say("Conform pressed for " .. itemName .. " (key)")
+      task.wait(wSettle)
+      return "fired"
+    end
   end
   return "stuck"
 end
@@ -2620,7 +2836,24 @@ local function dropSpamRandom(myToken)
     task.wait(1)
     return 0
   end
+  -- GUI FIRST: never scan/drop before the bag reads open. a never-opened
+  -- bag has no list (auto used to idle here while Drop All worked, because
+  -- Drop All opens first). one last button/key attempt, then give up this
+  -- pass - the auto loop retries in 2s instead of spinning on ghosts.
   openInventory()
+  if cancelledDrop(myToken) then setStatus("Status: stopped") return 0 end
+  do
+    local g = getInvFrame()
+    local open = g ~= nil and isGuiOpen(g)
+    if not open then
+      invFrameCache = nil
+      invToggleCacheAt = 0
+      if not setBagOpen(true) then
+        say("Inventory still closed - tap the bag button once, then run again")
+        return 0
+      end
+    end
+  end
   if cancelledDrop(myToken) then setStatus("Status: stopped") return 0 end
   fetchInventoryData()
   local units = 0
@@ -2691,9 +2924,9 @@ local function dropSpamRandom(myToken)
       misses[itemName] = 0
     elseif res == "stuck" then
       misses[itemName] = (misses[itemName] or 0) + 1
-      if misses[itemName] >= 3 then
+      if misses[itemName] >= 4 then
         dropDead[itemName] = tick()
-        say("Skipping " .. itemName .. " - no Drop button after 3 tries, you hold no " .. itemName .. " (bag ghost)")
+        say("Skipping " .. itemName .. " - no Drop after 4 tries, you hold no " .. itemName .. " (bag ghost)")
       end
     end
     -- batched rebuilds: normal every 3rd cycle, multidrop every 5th.
@@ -2709,8 +2942,10 @@ local function dropSpamRandom(myToken)
         expectedTotal = now
       end
       -- ghost watch: Conforms fired at this name since the last check, but
-      -- its FRESH count didn't move across two rebuilds = phantom. the game
-      -- crashes when phantoms get hammered, so blacklist on the 2nd hit.
+      -- its FRESH count didn't move across rebuilds = phantom. the game
+      -- crashes when phantoms get hammered, so blacklist on the 3rd hit
+      -- (was 2nd: laggy servers froze the count for a beat and real items
+      -- got condemned).
       do
         local frF, frS = snapshotFrame()
         for _, nm in ipairs(DropOrder) do
@@ -2727,7 +2962,7 @@ local function dropSpamRandom(myToken)
             end
             checkFired[nm] = firedTotal[nm]
             checkCount[nm] = fcount
-            if (ghostHits[nm] or 0) >= 2 then
+            if (ghostHits[nm] or 0) >= 3 then
               dropDead[nm] = tick()
               say("Skipping " .. nm .. " - bag shows " .. fcount .. " but nothing drops (ghost, you hold none)")
             end
