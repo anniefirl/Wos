@@ -80,6 +80,7 @@ local floatPos = "Above" -- "Above" | "Behind" | "Below"
 local SKILL_LIST = {"M1", "M2", "E", "R", "G", "C", "X", "V"}
 
 local Flags = { Drop = false, NpcFarm = false, Combo = false, NoV = false,
+  MultiDrop = false,
   DropsLoaded = false, NpcHeight = 5, FarmMethod = "Instant",
   Skills = { M1 = true, M2 = true, E = true, R = true,
     G = true, C = true, X = true, V = true } }
@@ -2385,6 +2386,12 @@ end
 local function dropUnitOnce(itemName, myToken)
   if cancelledDrop(myToken) then return "stopped" end
   holdDropSpot()
+  -- Multidrop toggle: tighter waits + shorter confirm window.
+  local fast = Flags.MultiDrop and true or false
+  local wClick = fast and 0.01 or 0.05
+  local wSettle = fast and 0.03 or 0.1
+  local pollN = fast and 12 or 30
+  local pollW = fast and 0.03 or 0.05
   local tool = findHeldTool(itemName)
   local slot = nil
   if tool then
@@ -2411,10 +2418,10 @@ local function dropUnitOnce(itemName, myToken)
       end
       if hum and hum.EquipTool then hum:EquipTool(slot) end
     end)
-    task.wait(0.15)
+    task.wait(fast and 0.05 or 0.15)
   else
     clickGui(slot)
-    task.wait(0.05)
+    task.wait(wClick)
   end
   if cancelledDrop(myToken) then return "stopped" end
   -- leftover confirmation first, then Drop + a fast poll for the popup.
@@ -2424,13 +2431,13 @@ local function dropUnitOnce(itemName, myToken)
   if preConfirm then
     clickGui(preConfirm)
     say("Conform pressed for " .. itemName)
-    task.wait(0.1)
+    task.wait(wSettle)
     return "fired"
   end
   local dropBtn = findDropButton(nil, frameB, snapB)
   if not dropBtn then return "stuck" end
   clickGui(dropBtn)
-  task.wait(0.05)
+  task.wait(wClick)
   -- some games morph the SAME button into the confirm step:
   -- if it now reads conform/confirm, press it again directly.
   local morphed = false
@@ -2439,18 +2446,17 @@ local function dropUnitOnce(itemName, myToken)
     if string.find(t, "conform") or string.find(t, "confirm") then morphed = true end
   end)
   if morphed then
-    task.wait(0.05)
+    task.wait(wClick)
     clickGui(dropBtn)
     say("Conform pressed for " .. itemName)
-    task.wait(0.1)
+    task.wait(wSettle)
     return "fired"
   end
   local confirmBtn = nil
   -- turbo poll: immediate check first (popup is usually already there
-  -- after a real click), then 0.05s beats. same ~1.5s window the patient
-  -- version had at 0.25s, but 4x the resolution so the press lands the
-  -- moment it appears.
-  for i = 1, 30 do
+  -- after a real click), then short beats. normal = same ~1.5s window the
+  -- patient version had at 0.25s; multidrop = ~0.36s window for speed.
+  for i = 1, pollN do
     if cancelledDrop(myToken) then return "stopped" end
     local frameC = getInvFrame()
     confirmBtn = findConfirmFast(frameC, dropBtn)
@@ -2460,12 +2466,12 @@ local function dropUnitOnce(itemName, myToken)
       confirmBtn = findConfirmButton(dropBtn, frameC, snapC)
     end
     if confirmBtn then break end
-    task.wait(0.05)
+    task.wait(pollW)
   end
   if confirmBtn then
     clickGui(confirmBtn)
     say("Conform pressed for " .. itemName)
-    task.wait(0.1)
+    task.wait(wSettle)
     return "fired"
   end
   return "stuck"
@@ -2557,7 +2563,9 @@ local function dropSpamRandom(myToken)
     local res = dropUnitOnce(itemName, myToken)
     if res == "stopped" then setStatus("Status: stopped") return units end
     if res == "fired" then units = units + 1 end
-    if cycle % 3 == 0 then
+    -- batched rebuilds: normal every 3rd cycle, multidrop every 5th.
+    local every = Flags.MultiDrop and 5 or 3
+    if cycle % every == 0 then
       refreshInventory()
       if cancelledDrop(myToken) then setStatus("Status: stopped") return units end
       local now = totalDropUnits()
@@ -2568,7 +2576,8 @@ local function dropSpamRandom(myToken)
         lastTotal = now
       end
       if flatRebuilds >= 3 then
-        -- 9+ cycles with zero movement: one remote sweep, then stop.
+        -- 9+ (normal) / 15+ (multidrop) cycles with zero movement:
+        -- one remote sweep, then stop.
         for _, nm in ipairs(presentDropNames()) do
           tryDropRemote(findHeldTool(nm), nm)
           task.wait(0.1)
@@ -2582,7 +2591,7 @@ local function dropSpamRandom(myToken)
         flatRebuilds = 0
       end
     else
-      task.wait(0.03)
+      if Flags.MultiDrop then task.wait(0.01) else task.wait(0.03) end
     end
   end
   setStatus("Status: drop gave up after 200 cycles")
@@ -3192,6 +3201,17 @@ dropToggle = DropsTab:AddToggle({
     end
     say("Auto Drop " .. (state and "enabled" or "disabled"))
     setStatus(state and "Status: drop on" or "Status: stopped")
+  end,
+})
+
+DropsTab:AddToggle({
+  Title    = "Multidrop",
+  Subtitle = "Faster cycle: tighter waits, rebuild every 5th (less safe on lag)",
+  Icon     = "zap",
+  Default  = false,
+  Callback = function(state)
+    Flags.MultiDrop = state
+    say("Multidrop " .. (state and "on: faster cycle, rebuild every 5th" or "off: normal cycle, rebuild every 3rd"))
   end,
 })
 
