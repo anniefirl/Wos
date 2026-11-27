@@ -2368,222 +2368,225 @@ local function findConfirmFast(frame, exceptBtn)
   return nil
 end
 
--- drops ONE item name until its count is 0. held tools (backpack + character)
--- first, GUI slots second. returns ok, saw.
--- TURBO: every wait cut to the bone (clicks are real either way - the waits
--- were the whole cost). one item now takes ~0.3s best-case instead of ~5s.
--- perf: each phase snapshots the frame ONCE and derives slot/drop/confirm
--- from that same list instead of re-walking all of PlayerGui 6-8 times
--- per attempt (the old code re-walked all of PlayerGui 6-8 times per
--- attempt - that scan spam is what lagged/crashed the game).
-local function dropOneOf(itemName, myToken)
-  local noProgress = 0
-  local saw = false
-  for attempt = 1, 30 do
-    if cancelledDrop(myToken) then setStatus("Status: stopped") return false, saw end
-    holdDropSpot()
-    local slot = nil
-    local count = 0
-    local isTool = false
-    local tool = findHeldTool(itemName)
-    if tool then
-      slot = tool
-      count = 1
-      isTool = true
-      saw = true
+-- SPAM drop: arrows + fruit in RANDOM order, one unit per cycle, instead of
+-- emptying legendary -> shiny -> stand -> locacaca in sequence. interleaving
+-- is faster in-game (no per-stack stalls), and the bag only closes +
+-- reopens every few units (batched rebuilds) instead of after every press.
+-- TURBO: clicks are real either way - the waits were the whole cost, so
+-- every wait stays cut to the bone (slot/drop 0.05s, confirm poll 30x0.05s,
+-- settle 0.1s). perf: one shared frame snapshot per phase, never full
+-- PlayerGui walks per attempt (that scan spam is what lagged the game).
+-- never throws.
+
+-- ONE spam cycle for a single item: slot -> Drop -> Conform, exactly one
+-- unit. no rebuild inside (the caller batches those). returns "fired" (a
+-- Conform press went out), "nosuch" (nothing by that name right now),
+-- "stuck" (slot seen but no Drop/Conform press happened), or "stopped".
+local function dropUnitOnce(itemName, myToken)
+  if cancelledDrop(myToken) then return "stopped" end
+  holdDropSpot()
+  local tool = findHeldTool(itemName)
+  local slot = nil
+  if tool then
+    slot = tool
+  else
+    local frame0, snap0 = snapshotFrame()
+    local gs = nil
+    if frame0 then
+      gs = findItemSlotIn(frame0, itemName, snap0)
     else
-      local frame0, snap0 = snapshotFrame()
-      local gs, gc = nil, nil
-      if frame0 then
-        gs, gc = findItemSlotIn(frame0, itemName, snap0)
-      else
-        gs, gc = findItemSlot(itemName)
-      end
-      if not gs then
-        return true, saw
-      end
-      slot = gs
-      count = gc or 1
-      saw = true
+      gs = findItemSlot(itemName)
     end
-    setStatus("Status: drop [" .. itemName .. "] (" .. count .. " left)...")
-    if isTool then
-      -- equip it so the Drop button / Backspace has something to drop
-      pcall(function()
-        local char = LP.Character
-        local hum = nil
-        if char then
-          if char.FindFirstChildOfClass then hum = char:FindFirstChildOfClass("Humanoid")
-          else hum = char:FindFirstChild("Humanoid") end
-        end
-        if hum and hum.EquipTool then hum:EquipTool(slot) end
-      end)
-      task.wait(0.15)
-    else
-      clickGui(slot)
-      task.wait(0.05)
-    end
-    if cancelledDrop(myToken) then setStatus("Status: stopped") return false, saw end
-    -- recount: cheap held-tool check first; one GUI snapshot only if needed.
-    -- gone from hands AND pack means actually dropped.
-    local t2 = findHeldTool(itemName)
-    local s2, c2 = nil, nil
-    if not t2 then
-      local frame2, snap2 = snapshotFrame()
-      if frame2 then
-        s2, c2 = findItemSlotIn(frame2, itemName, snap2)
-      else
-        s2, c2 = findItemSlot(itemName)
-      end
-    end
-    if not t2 and not s2 then
-      return true, saw
-    end
-    local progressed = (not isTool) and s2 and (c2 or 1) < count
-    if progressed then
-      noProgress = 0
-    else
-      -- leftover confirmation first, then Drop + a fast poll for the popup,
-      -- then remote + Backspace at most 1 in 3 tries (server safety).
-      -- 1. leftover confirmation from the last attempt? press it, don't re-drop.
-      -- one snapshot serves both the pre-confirm and the Drop lookup.
-      local frameB, snapB = snapshotFrame()
-      local preConfirm = findConfirmButton(nil, frameB, snapB)
-      if preConfirm then
-        clickGui(preConfirm)
-        say("Conform pressed for " .. itemName)
-        task.wait(0.15)
-        -- close + reopen so the list rebuilds: the game freezes the
-        -- visible counts while the bag stays open (ghosts), the recount
-        -- below must read a fresh list.
-        refreshInventory()
-      else
-        -- 2. Drop button, then POLL for the confirmation (it can pop in late)
-        local dropBtn = findDropButton(nil, frameB, snapB)
-        if dropBtn then
-          clickGui(dropBtn)
-          task.wait(0.05)
-          -- some games morph the SAME button into the confirm step:
-          -- if it now reads conform/confirm, press it again directly.
-          local morphed = false
-          pcall(function()
-            local t = string.lower(dropBtn.Text or "")
-            if string.find(t, "conform") or string.find(t, "confirm") then morphed = true end
-          end)
-          if morphed then
-            task.wait(0.05)
-            clickGui(dropBtn)
-            say("Conform pressed for " .. itemName)
-          end
-          local confirmBtn = nil
-          -- turbo poll: immediate check first (popup is usually already
-          -- there after a real click), then 0.05s beats. same ~1.5s
-          -- window the patient version had at 0.25s, but 4x the
-          -- resolution so the press lands the moment it appears.
-          for i = 1, 30 do
-            if cancelledDrop(myToken) then setStatus("Status: stopped") return false, saw end
-            local frameC = getInvFrame()
-            confirmBtn = findConfirmFast(frameC, dropBtn)
-            if not confirmBtn and i % 3 == 1 then
-              local snapC = nil
-              if frameC then pcall(function() snapC = frameC:GetDescendants() end) end
-              confirmBtn = findConfirmButton(dropBtn, frameC, snapC)
-            end
-            if confirmBtn then break end
-            task.wait(0.05)
-          end
-          if confirmBtn then
-            clickGui(confirmBtn)
-            say("Conform pressed for " .. itemName)
-          else
-            say("Drop: no Conform popup appeared for " .. itemName .. " (press Scan GUI if this repeats)")
-          end
-          task.wait(0.15)
-          -- same rebuild as above: close + reopen so the next recount
-          -- reads fresh counts, not the frozen open-bag list.
-          refreshInventory()
-        else
-          say("Drop: no Drop button found for " .. itemName .. " - trying remote/Backspace")
-        end
-      end
-      if cancelledDrop(myToken) then setStatus("Status: stopped") return false, saw end
-      local t3 = findHeldTool(itemName)
-      local s3, c3 = nil, nil
-      if not t3 then
-        local frame3, snap3 = snapshotFrame()
-        if frame3 then s3, c3 = findItemSlotIn(frame3, itemName, snap3)
-        else s3, c3 = findItemSlot(itemName) end
-      end
-      if not t3 and not s3 then return true, saw end
-      local progressed2 = (not isTool) and s3 and (c3 or 1) < count
-      if progressed2 then
-        noProgress = 0
-      else
-        -- server cadence stays calm: remote + Backspace at most 1 in 3
-        -- tries (every-attempt spam got players kicked; clicks are
-        -- unlimited, server calls are not).
-        if attempt % 3 == 1 then
-          tryDropRemote(t3 or s3, itemName)
-          task.wait(0.2)
-          if isTool then
-            -- last resort: Backspace drops the equipped tool in default backpacks
-            pcall(function()
-              local vim = game:GetService("VirtualInputManager")
-              if vim and vim.SendKeyEvent then
-                vim:SendKeyEvent(true, Enum.KeyCode.Backspace, false, game)
-                task.wait(0.05)
-                vim:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
-              end
-            end)
-            task.wait(0.1)
-          end
-        else
-          task.wait(0.2)
-        end
-        if cancelledDrop(myToken) then setStatus("Status: stopped") return false, saw end
-        local t4 = findHeldTool(itemName)
-        local s4, c4 = nil, nil
-        if not t4 then
-          local frame4, snap4 = snapshotFrame()
-          if frame4 then s4, c4 = findItemSlotIn(frame4, itemName, snap4)
-          else s4, c4 = findItemSlot(itemName) end
-        end
-        if not t4 and not s4 then return true, saw end
-        local progressed3 = (not isTool) and s4 and (c4 or 1) < count
-        if progressed3 then noProgress = 0
-        else
-          -- ghost guard: the list may still show an item the server already
-          -- removed. force a rebuild, then recount the FRESH list before
-          -- calling this attempt stuck.
-          refreshInventory()
-          if cancelledDrop(myToken) then setStatus("Status: stopped") return false, saw end
-          local t5 = findHeldTool(itemName)
-          local s5, c5 = nil, nil
-          if not t5 then
-            local frame5, snap5 = snapshotFrame()
-            if frame5 then s5, c5 = findItemSlotIn(frame5, itemName, snap5)
-            else s5, c5 = findItemSlot(itemName) end
-          end
-          if not t5 and not s5 then return true, saw end
-          local progressed4 = (not isTool) and s5 and (c5 or 1) < count
-          if progressed4 then noProgress = 0
-          else noProgress = noProgress + 1 end
-        end
-      end
-    end
-    if cancelledDrop(myToken) then setStatus("Status: stopped") return false, saw end
-    if noProgress >= 3 then
-      setStatus("Status: drop [" .. itemName .. "] stuck, moving on")
-      say("Could not drop " .. itemName .. " - leaving it and moving on")
-      pcall(function()
-        Window:Notify({ Title = "Drop stuck", Text = itemName .. " would not drop - see log", Duration = 4 })
-      end)
-      return false, saw
-    end
-    task.wait(0.03)
+    if not gs then return "nosuch" end
+    slot = gs
   end
-  setStatus("Status: drop [" .. itemName .. "] gave up after 30 tries")
-  return false, saw
+  if tool then
+    -- equip it so the Drop button has something to drop
+    pcall(function()
+      local char = LP.Character
+      local hum = nil
+      if char then
+        if char.FindFirstChildOfClass then hum = char:FindFirstChildOfClass("Humanoid")
+        else hum = char:FindFirstChild("Humanoid") end
+      end
+      if hum and hum.EquipTool then hum:EquipTool(slot) end
+    end)
+    task.wait(0.15)
+  else
+    clickGui(slot)
+    task.wait(0.05)
+  end
+  if cancelledDrop(myToken) then return "stopped" end
+  -- leftover confirmation first, then Drop + a fast poll for the popup.
+  -- one snapshot serves both the pre-confirm and the Drop lookup.
+  local frameB, snapB = snapshotFrame()
+  local preConfirm = findConfirmButton(nil, frameB, snapB)
+  if preConfirm then
+    clickGui(preConfirm)
+    say("Conform pressed for " .. itemName)
+    task.wait(0.1)
+    return "fired"
+  end
+  local dropBtn = findDropButton(nil, frameB, snapB)
+  if not dropBtn then return "stuck" end
+  clickGui(dropBtn)
+  task.wait(0.05)
+  -- some games morph the SAME button into the confirm step:
+  -- if it now reads conform/confirm, press it again directly.
+  local morphed = false
+  pcall(function()
+    local t = string.lower(dropBtn.Text or "")
+    if string.find(t, "conform") or string.find(t, "confirm") then morphed = true end
+  end)
+  if morphed then
+    task.wait(0.05)
+    clickGui(dropBtn)
+    say("Conform pressed for " .. itemName)
+    task.wait(0.1)
+    return "fired"
+  end
+  local confirmBtn = nil
+  -- turbo poll: immediate check first (popup is usually already there
+  -- after a real click), then 0.05s beats. same ~1.5s window the patient
+  -- version had at 0.25s, but 4x the resolution so the press lands the
+  -- moment it appears.
+  for i = 1, 30 do
+    if cancelledDrop(myToken) then return "stopped" end
+    local frameC = getInvFrame()
+    confirmBtn = findConfirmFast(frameC, dropBtn)
+    if not confirmBtn and i % 3 == 1 then
+      local snapC = nil
+      if frameC then pcall(function() snapC = frameC:GetDescendants() end) end
+      confirmBtn = findConfirmButton(dropBtn, frameC, snapC)
+    end
+    if confirmBtn then break end
+    task.wait(0.05)
+  end
+  if confirmBtn then
+    clickGui(confirmBtn)
+    say("Conform pressed for " .. itemName)
+    task.wait(0.1)
+    return "fired"
+  end
+  return "stuck"
+end
+
+-- names currently droppable: held tools first, then one shared snapshot
+-- for all four slot checks (was up to 8 full tree walks).
+local function presentDropNames()
+  local out = {}
+  local have = {}
+  for _, itemName in ipairs(DropOrder) do
+    if findHeldTool(itemName) then
+      out[#out + 1] = itemName
+      have[itemName] = true
+    end
+  end
+  local frame, snap = snapshotFrame()
+  if frame then
+    for _, itemName in ipairs(DropOrder) do
+      if not have[itemName] and findItemSlotIn(frame, itemName, snap) then
+        out[#out + 1] = itemName
+      end
+    end
+  else
+    for _, itemName in ipairs(DropOrder) do
+      if not have[itemName] and findItemSlot(itemName) then
+        out[#out + 1] = itemName
+      end
+    end
+  end
+  return out
+end
+
+-- rough total units left, for the stuck guard: held tools + one shared
+-- snapshot sum. approximate is fine (held + slot double-counts).
+local function totalDropUnits()
+  local total = 0
+  for _, itemName in ipairs(DropOrder) do
+    if findHeldTool(itemName) then total = total + 1 end
+  end
+  local frame, snap = snapshotFrame()
+  if frame then
+    for _, itemName in ipairs(DropOrder) do
+      local s, c = findItemSlotIn(frame, itemName, snap)
+      if s then total = total + (c or 1) end
+    end
+  end
+  return total
+end
+
+-- the spam loop: a random item every cycle until a fresh rebuild shows the
+-- bag empty. the bag closes + reopens every 3rd cycle (batched rebuilds)
+-- so the list updates without paying open/close on every unit. returns
+-- units fired. never throws.
+local function dropSpamRandom(myToken)
+  if cancelledDrop(myToken) then setStatus("Status: stopped") return 0 end
+  freezeAtDropSpot()
+  if not chestHRP() then
+    setStatus("Status: waiting for character...")
+    task.wait(1)
+    return 0
+  end
+  openInventory()
+  if cancelledDrop(myToken) then setStatus("Status: stopped") return 0 end
+  fetchInventoryData()
+  local units = 0
+  local flatRebuilds = 0
+  local lastTotal = totalDropUnits()
+  for cycle = 1, 200 do
+    if cancelledDrop(myToken) then setStatus("Status: stopped") return units end
+    holdDropSpot()
+    local present = presentDropNames()
+    if #present == 0 then
+      -- confirm on a FRESH list: truly empty, or just ghosts.
+      refreshInventory()
+      if cancelledDrop(myToken) then setStatus("Status: stopped") return units end
+      present = presentDropNames()
+      if #present == 0 then
+        refreshInventory()
+        if cancelledDrop(myToken) then setStatus("Status: stopped") return units end
+        setStatus("Status: drop done - arrows/fruit at 0")
+        say("Drop spam done: " .. units .. " dropped")
+        return units
+      end
+    end
+    local itemName = present[1]
+    pcall(function() itemName = present[math.random(1, #present)] end)
+    setStatus("Status: drop [" .. itemName .. "]...")
+    local res = dropUnitOnce(itemName, myToken)
+    if res == "stopped" then setStatus("Status: stopped") return units end
+    if res == "fired" then units = units + 1 end
+    if cycle % 3 == 0 then
+      refreshInventory()
+      if cancelledDrop(myToken) then setStatus("Status: stopped") return units end
+      local now = totalDropUnits()
+      if now >= lastTotal then
+        flatRebuilds = flatRebuilds + 1
+      else
+        flatRebuilds = 0
+        lastTotal = now
+      end
+      if flatRebuilds >= 3 then
+        -- 9+ cycles with zero movement: one remote sweep, then stop.
+        for _, nm in ipairs(presentDropNames()) do
+          tryDropRemote(findHeldTool(nm), nm)
+          task.wait(0.1)
+        end
+        refreshInventory()
+        if totalDropUnits() >= lastTotal then
+          setStatus("Status: drop stuck, stopping")
+          say("Drop spam stuck - see log (press Scan GUI if this repeats)")
+          return units
+        end
+        flatRebuilds = 0
+      end
+    else
+      task.wait(0.03)
+    end
+  end
+  setStatus("Status: drop gave up after 200 cycles")
+  return units
 end
 
 -- pure read: anything to drop right now? no teleport, no waits, so the
@@ -2606,49 +2609,6 @@ local function dropHasWork()
     if slot then return true end
   end
   return false
-end
-
--- priority order: legendary -> shiny -> stand -> locacaca, each until 0.
-local function dropAllPriority(myToken)
-  if cancelledDrop(myToken) then setStatus("Status: stopped") return 0, false end
-  freezeAtDropSpot()
-  if not chestHRP() then
-    setStatus("Status: waiting for character...")
-    task.wait(1)
-    return 0, false
-  end
-  openInventory()
-  if cancelledDrop(myToken) then setStatus("Status: stopped") return 0 end
-  fetchInventoryData()
-  if cancelledDrop(myToken) then setStatus("Status: stopped") return 0 end
-  local emptied = 0
-  local sawAny = false
-  for _, itemName in ipairs(DropOrder) do
-    if cancelledDrop(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-    setStatus("Status: drop [" .. itemName .. "]...")
-    local ok, saw = dropOneOf(itemName, myToken)
-    if saw then sawAny = true end
-    if ok then emptied = emptied + 1 end
-    -- the last unit of an item drops without a trailing rebuild (the
-    -- recount sees "gone" and returns), so rebuild here: otherwise the
-    -- next item starts from the frozen open-bag list and chases ghosts.
-    if saw then
-      refreshInventory()
-      if cancelledDrop(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-    end
-    if cancelledDrop(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-    task.wait(0.03)
-  end
-  if cancelledDrop(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-  -- final rebuild so the player sees the true (empty) list, not ghosts.
-  -- skipped when nothing was ever seen: nothing changed, no rebuild needed.
-  if sawAny then
-    refreshInventory()
-    if cancelledDrop(myToken) then setStatus("Status: stopped") return emptied, sawAny end
-  end
-  setStatus("Status: drop done - arrows/fruit at 0")
-  say("Drop All done")
-  return emptied, sawAny
 end
 
 -- Scan: dumps PlayerGui tree + backpack + drop/inventory remotes into the log
@@ -3206,7 +3166,7 @@ local DropsTab = Window:AddTab("Drops", "package")
 
 dropToggle = DropsTab:AddToggle({
   Title    = "Auto Drop",
-  Subtitle = "Clicks do slot -> Drop -> Conform, each to 0 (rebuilds after each)",
+  Subtitle = "Spam-drops arrows/fruit in random order (rebuilds as it goes)",
   Icon     = "package",
   Default  = false,
   Callback = function(state)
@@ -3215,10 +3175,10 @@ dropToggle = DropsTab:AddToggle({
     if state then
       local myToken = dropToken
       task.spawn(function()
-        say("Auto Drop looping (turbo clicks)")
+        say("Auto Drop looping (spam: random order)")
         while Flags.Drop and not cancelledDrop(myToken) do
           if dropHasWork() then
-            dropAllPriority(myToken)
+            dropSpamRandom(myToken)
           else
             setStatus("Status: drop idle - nothing to drop")
           end
@@ -3237,16 +3197,16 @@ dropToggle = DropsTab:AddToggle({
 
 DropsTab:AddButton({
   Title    = "Drop All Now",
-  Subtitle = "One turbo pass: each item to 0",
+  Subtitle = "One spam pass: random order until empty",
   Icon     = "package-open",
   Text     = "Drop All",
   Callback = function()
     dropToken = dropToken + 1
     local myToken = dropToken
-    say("Drop All started (turbo clicks)")
+    say("Drop spam started (random order)")
     task.spawn(function()
-      local emptied = dropAllPriority(myToken)
-      say("Drop All done: " .. emptied .. " item types emptied")
+      local emptied = dropSpamRandom(myToken)
+      say("Drop All done: " .. emptied .. " dropped (spam)")
     end)
   end,
 })
@@ -3416,7 +3376,7 @@ if FALLBACK then
         conform.Visible = false
       end)
       print("Demo: 3-item inventory placed (stand-ins).")
-      dropAllPriority(nil)
+      dropSpamRandom(nil)
       say("Drop demo: all stacks to 0 (pass done)")
     end
   end
