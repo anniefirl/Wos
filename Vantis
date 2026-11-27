@@ -1572,6 +1572,26 @@ end
 -- never throws.
 local dropToken = 0
 
+-- ghost blacklist: bag shows N but the server holds 0 (your 12-arrow case).
+-- hammering a phantom - clicks, polls, full-bag rebuilds - is what tips
+-- the game over, so phantoms get skipped fast instead. name -> tick() of
+-- blacklisting; entries expire after 120s so a re-farmed real stack is
+-- retried on its own. never throws.
+local dropDead = {}
+
+-- the auto loop must not scan before the game has built any list: a bag
+-- that was never opened this session has no scannable frame, so
+-- dropHasWork reads empty and the toggle idles forever (Drop All works
+-- because it opens first). primed once the bag has cleanly opened.
+local bagPrimed = false
+
+local function isDead(name)  local t = dropDead[name]
+  if t == nil then return false end
+  if tick() - t < 120 then return true end
+  dropDead[name] = nil
+  return false
+end
+
 -- any drop loop carrying an old token must stop at its next checkpoint.
 -- nil token = no cancellation (demo / one-off calls).
 local function cancelledDrop(myToken)
@@ -1701,94 +1721,146 @@ local function findInventoryToggle()
   return nil
 end
 
-local function openInventory()
-  local gui = getInvFrame()
-  if not gui then
-    setStatus("Status: inventory GUI not found")
-    say("Inventory GUI not found (looked for 'InventoryFrame' in PlayerGui)")
-    return false
+-- cached bag button: full PlayerGui scans on every refresh are the biggest
+-- self-inflicted lag spike in the drop loop, so resolve once and reuse
+-- while it stays alive (60s TTL, alive check guards HUD rebuilds).
+local invToggleCache = nil
+local invToggleCacheAt = 0
+local function getInvToggle()
+  -- a cached miss (nil) is valid too: without this a missing button would
+  -- rescan all of PlayerGui on every refresh.
+  if invToggleCacheAt > 0 and tick() - invToggleCacheAt < 60 then
+    local b = invToggleCache
+    if b == nil then return nil end
+    local alive = false
+    pcall(function()
+      alive = b.Parent ~= nil
+    end)
+    if alive then return b end
   end
-  setGuiOpen(gui, true)
-  task.wait(0.05)
-  if isGuiOpen(gui) then
-    setStatus("Status: inventory open")
-    say("Inventory opened")
-    return true
+  local b = findInventoryToggle()
+  invToggleCache = b
+  invToggleCacheAt = tick()
+  if b ~= nil then
+    local nm = "?"
+    pcall(function() nm = tostring(b.Name) end)
+    say("Bag button: '" .. nm .. "'")
+  else
+    say("Bag button not found - using Visible flip (list may not rebuild)")
   end
-  -- game keeps it shut: tap its own toggle button like a player would.
-  local toggle = findInventoryToggle()
-  if toggle then
+  return b
+end
+
+-- a REAL mouse click at the button's screen center through
+-- VirtualInputManager. clickGui (firesignal/Activate) is silent input: if
+-- the game wired its bag button to MouseButton1Click and the executor
+-- lacks firesignal, Activate() alone never reaches it and the bag never
+-- opens/closes. a VIM click lands no matter which connection the game
+-- used. drops themselves still use clickGui only (no taps there); this is
+-- just for the bag open/close. never throws. returns true if sent.
+local function vuClick(btn)
+  if btn == nil then return false end
+  local vu = nil
+  pcall(function() vu = game:GetService("VirtualInputManager") end)
+  if vu == nil then return false end
+  local center = nil
+  pcall(function()
+    local p = btn.AbsolutePosition
+    local s = btn.AbsoluteSize
+    center = Vector2.new(p.X + s.X / 2, p.Y + s.Y / 2)
+  end)
+  if center == nil then return false end
+  local sent = false
+  pcall(function()
+    if vu.ClickButton1 ~= nil then
+      local cam = nil
+      pcall(function() cam = workspace.CurrentCamera end)
+      if cam ~= nil then vu:ClickButton1(center, cam)
+      else vu:ClickButton1(center) end
+      sent = true
+    elseif vu.SendMouseButtonEvent ~= nil then
+      vu:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 0)
+      task.wait(0.05)
+      vu:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 0)
+      sent = true
+    end
+  end)
+  return sent
+end
+
+-- drives the bag to a real open/closed state through the game's OWN button:
+-- signal click first (free when the executor supports it), verify, then a
+-- real VIM click when the state did not move, verify, then the Visible
+-- flip as last resort. logs which path worked so the log shows whether
+-- the bag actually moves in-game. never throws. returns true if the bag
+-- is in the asked state.
+local function setBagOpen(open)
+  local function isOpen()
+    local g = getInvFrame()
+    return g ~= nil and isGuiOpen(g)
+  end
+  if isOpen() == open then return true end
+  local toggle = getInvToggle()
+  if toggle ~= nil then
     clickGui(toggle)
-    task.wait(0.1)
-    if isGuiOpen(gui) then
+    task.wait(0.15)
+    invFrameCache = nil
+    if isOpen() == open then
+      say("Bag " .. (open and "opened" or "closed") .. " (button)")
+      return true
+    end
+    if vuClick(toggle) then
+      task.wait(0.2)
+      invFrameCache = nil
+      if isOpen() == open then
+        say("Bag " .. (open and "opened" or "closed") .. " (real click)")
+        return true
+      end
+      say("Bag " .. (open and "open" or "close") .. " did not move - check Scan GUI for the real button name")
+    end
+  else
+    local gui = getInvFrame()
+    if gui ~= nil then
+      setGuiOpen(gui, open)
+      task.wait(0.1)
+      invFrameCache = nil
+    end
+  end
+  return isOpen() == open
+end
+
+local function openInventory()
+  if setBagOpen(true) then
+    local gui = getInvFrame()
+    if gui ~= nil and isGuiOpen(gui) then
+      bagPrimed = true
       setStatus("Status: inventory open")
       say("Inventory opened")
       return true
     end
   end
-  -- last resort: one toggle tap can force the game to build/populate the
-  -- item list even when Visible=true already reads "open" but no slots
-  -- respond (the old silent "does nothing" case). never throws.
-  if toggle then
-    clickGui(toggle)
-    task.wait(0.15)
-    setGuiOpen(gui, true)
-    task.wait(0.1)
+  -- last resort: force Visible even if the game disagrees, then continue.
+  local gui = getInvFrame()
+  if gui == nil then
+    setStatus("Status: inventory GUI not found")
+    say("Inventory GUI not found (looked for 'InventoryFrame' in PlayerGui)")
+    return false
   end
+  setGuiOpen(gui, true)
+  task.wait(0.1)
   setStatus("Status: inventory may still be closed - continuing anyway")
-  say("Inventory would not stay closed - continuing anyway")
+  say("Inventory would not open - continuing anyway")
   return true
 end
 
--- forces the game to rebuild its item list: close, reopen, recount.
--- the client GUI often keeps showing dropped items (ghosts) even though the
--- server already removed them - without this both the player AND the script
--- recount believe items that are already gone.
--- forces the game to rebuild its item list: CLOSE the bag, then REOPEN it,
--- through the game's OWN toggle button so its open/close scripts actually
--- run and the list updates. just flipping Visible does not run the game's
--- logic - the bag looks open but the counts stay frozen on ghosts, which
--- is why the recount kept seeing already-dropped items. falls back to the
--- Visible flip when no toggle button exists (mock demo). never throws.
--- returns the re-fetched frame or nil.
+-- forces the game to rebuild its item list: CLOSE the bag, then REOPEN it
+-- (setBagOpen verifies each state and falls back to a real VIM click when
+-- silent signal clicks don't move it). just flipping Visible does not run
+-- the game's logic - the bag looks open but the counts stay frozen on
+-- ghosts. never throws. returns true when the bag ends open.
 local function refreshInventory()
-  local toggle = findInventoryToggle()
-  if toggle ~= nil then
-    local gui = getInvFrame()
-    if gui == nil or isGuiOpen(gui) then
-      clickGui(toggle) -- close
-      task.wait(0.2)
-    end
-    invFrameCache = nil -- the game may destroy + rebuild the frame: rescan
-    gui = getInvFrame()
-    if gui == nil then
-      clickGui(toggle) -- closed state destroys the frame: tap again to open
-      task.wait(0.25)
-      invFrameCache = nil
-      gui = getInvFrame()
-    end
-    if gui ~= nil and not isGuiOpen(gui) then
-      clickGui(toggle) -- open
-      task.wait(0.25)
-      invFrameCache = nil
-      gui = getInvFrame()
-    end
-    if gui ~= nil and not isGuiOpen(gui) then
-      setGuiOpen(gui, true)
-      task.wait(0.15)
-    end
-    return getInvFrame()
-  end
-  local gui = getInvFrame()
-  if not gui then return nil end
-  setGuiOpen(gui, false)
-  task.wait(0.15)
-  invFrameCache = nil
-  gui = getInvFrame()
-  if gui == nil then return nil end
-  setGuiOpen(gui, true)
-  task.wait(0.2)
-  return gui
+  setBagOpen(false)
+  return setBagOpen(true)
 end
 
 -- Drop spot: while auto drop runs, the player is frozen here, standing upright.
@@ -2435,7 +2507,16 @@ local function dropUnitOnce(itemName, myToken)
     return "fired"
   end
   local dropBtn = findDropButton(nil, frameB, snapB)
-  if not dropBtn then return "stuck" end
+  if not dropBtn then
+    -- one re-tap: selection can lag a beat behind the slot press on a busy
+    -- server. only a missing button after TWO taps counts as stuck, so a
+    -- real item is never condemned on one slow frame.
+    clickGui(slot)
+    task.wait(wClick)
+    local frameB2, snapB2 = snapshotFrame()
+    dropBtn = findDropButton(nil, frameB2, snapB2)
+    if not dropBtn then return "stuck" end
+  end
   clickGui(dropBtn)
   task.wait(wClick)
   -- some games morph the SAME button into the confirm step:
@@ -2482,6 +2563,10 @@ end
 local function presentDropNames()
   local out = {}
   local have = {}
+  -- blacklisted ghosts are pre-marked so both scans below skip them.
+  for _, itemName in ipairs(DropOrder) do
+    if isDead(itemName) then have[itemName] = true end
+  end
   for _, itemName in ipairs(DropOrder) do
     if findHeldTool(itemName) then
       out[#out + 1] = itemName
@@ -2523,9 +2608,10 @@ local function totalDropUnits()
 end
 
 -- the spam loop: a random item every cycle until a fresh rebuild shows the
--- bag empty. the bag closes + reopens every 3rd cycle (batched rebuilds)
--- so the list updates without paying open/close on every unit. returns
--- units fired. never throws.
+-- bag empty. the bag closes + reopens at batched checkpoints (every 3rd
+-- cycle, 5th on multidrop) - and only when the visible list disagrees with
+-- what was actually dropped, so live-updating games pay zero rebuilds.
+-- returns units fired. never throws.
 local function dropSpamRandom(myToken)
   if cancelledDrop(myToken) then setStatus("Status: stopped") return 0 end
   freezeAtDropSpot()
@@ -2540,6 +2626,32 @@ local function dropSpamRandom(myToken)
   local units = 0
   local flatRebuilds = 0
   local lastTotal = totalDropUnits()
+  -- what the list SHOULD show: every fired Conform drops exactly one unit,
+  -- so when the visible count already matches expectation the game is
+  -- updating live and the close/reopen (the laggiest step - the game
+  -- rebuilds the whole bag UI) can be skipped with zero risk.
+  local expectedTotal = lastTotal
+  -- per-name ghost tracking: consecutive "stuck" (no Drop button after two
+  -- slot taps) and fired-Conforms that never move the fresh count both mark
+  -- GUI phantoms. phantoms join dropDead instead of being hammered.
+  local misses = {}
+  local firedTotal = {}
+  local checkFired = {}
+  local checkCount = {}
+  local ghostHits = {}
+  local function deadNames()
+    local out = {}
+    for _, n in ipairs(DropOrder) do
+      if isDead(n) then out[#out + 1] = n end
+    end
+    return out
+  end
+  -- cheap early-out: everything left is blacklisted ghosts, so don't even
+  -- open the bag (auto-loop re-entry lands here every 2s while ghosts show).
+  if #presentDropNames() == 0 then
+    setStatus("Status: drop idle - nothing to drop")
+    return 0
+  end
   for cycle = 1, 200 do
     if cancelledDrop(myToken) then setStatus("Status: stopped") return units end
     holdDropSpot()
@@ -2552,23 +2664,76 @@ local function dropSpamRandom(myToken)
       if #present == 0 then
         refreshInventory()
         if cancelledDrop(myToken) then setStatus("Status: stopped") return units end
-        setStatus("Status: drop done - arrows/fruit at 0")
-        say("Drop spam done: " .. units .. " dropped")
+        expectedTotal = totalDropUnits()
+        lastTotal = expectedTotal
+        local skipped = deadNames()
+        if #skipped > 0 then
+          setStatus("Status: drop done - skipped ghosts: " .. table.concat(skipped, ", "))
+          say("Drop spam done: " .. units .. " dropped (skipped ghosts you don't hold: " .. table.concat(skipped, ", ") .. ")")
+        else
+          setStatus("Status: drop done - arrows/fruit at 0")
+          say("Drop spam done: " .. units .. " dropped")
+        end
         return units
       end
+      expectedTotal = totalDropUnits()
+      lastTotal = expectedTotal
     end
     local itemName = present[1]
     pcall(function() itemName = present[math.random(1, #present)] end)
     setStatus("Status: drop [" .. itemName .. "]...")
     local res = dropUnitOnce(itemName, myToken)
     if res == "stopped" then setStatus("Status: stopped") return units end
-    if res == "fired" then units = units + 1 end
+    if res == "fired" then
+      units = units + 1
+      expectedTotal = expectedTotal - 1
+      firedTotal[itemName] = (firedTotal[itemName] or 0) + 1
+      misses[itemName] = 0
+    elseif res == "stuck" then
+      misses[itemName] = (misses[itemName] or 0) + 1
+      if misses[itemName] >= 3 then
+        dropDead[itemName] = tick()
+        say("Skipping " .. itemName .. " - no Drop button after 3 tries, you hold no " .. itemName .. " (bag ghost)")
+      end
+    end
     -- batched rebuilds: normal every 3rd cycle, multidrop every 5th.
+    -- skipped entirely while the visible list tracks expectation (live
+    -- updating game = no rebuilds = no lag spikes).
     local every = Flags.MultiDrop and 5 or 3
     if cycle % every == 0 then
-      refreshInventory()
-      if cancelledDrop(myToken) then setStatus("Status: stopped") return units end
       local now = totalDropUnits()
+      if now > expectedTotal then
+        refreshInventory()
+        if cancelledDrop(myToken) then setStatus("Status: stopped") return units end
+        now = totalDropUnits()
+        expectedTotal = now
+      end
+      -- ghost watch: Conforms fired at this name since the last check, but
+      -- its FRESH count didn't move across two rebuilds = phantom. the game
+      -- crashes when phantoms get hammered, so blacklist on the 2nd hit.
+      do
+        local frF, frS = snapshotFrame()
+        for _, nm in ipairs(DropOrder) do
+          if not isDead(nm) and (firedTotal[nm] or 0) > (checkFired[nm] or 0) then
+            local fcount = 0
+            if frF then
+              local s, c = findItemSlotIn(frF, nm, frS)
+              if s then fcount = c or 1 end
+            end
+            if checkCount[nm] ~= nil and fcount == checkCount[nm] then
+              ghostHits[nm] = (ghostHits[nm] or 0) + 1
+            else
+              ghostHits[nm] = 0
+            end
+            checkFired[nm] = firedTotal[nm]
+            checkCount[nm] = fcount
+            if (ghostHits[nm] or 0) >= 2 then
+              dropDead[nm] = tick()
+              say("Skipping " .. nm .. " - bag shows " .. fcount .. " but nothing drops (ghost, you hold none)")
+            end
+          end
+        end
+      end
       if now >= lastTotal then
         flatRebuilds = flatRebuilds + 1
       else
@@ -2585,7 +2750,7 @@ local function dropSpamRandom(myToken)
         refreshInventory()
         if totalDropUnits() >= lastTotal then
           setStatus("Status: drop stuck, stopping")
-          say("Drop spam stuck - see log (press Scan GUI if this repeats)")
+          say("Drop spam stuck - ghosts skipped already; Scan GUI if real items won't drop")
           return units
         end
         flatRebuilds = 0
@@ -3182,12 +3347,27 @@ dropToggle = DropsTab:AddToggle({
     Flags.Drop = state
     dropToken = dropToken + 1
     if state then
+      bagPrimed = false -- fresh intent: rebuild the list from scratch
       local myToken = dropToken
       task.spawn(function()
         say("Auto Drop looping (spam: random order)")
+        -- open FIRST, then scan: a never-opened bag has no list to find,
+        -- which is why the toggle used to idle until Drop All was tapped.
+        openInventory()
         while Flags.Drop and not cancelledDrop(myToken) do
           if dropHasWork() then
             dropSpamRandom(myToken)
+          elseif not bagPrimed or getInvFrame() == nil then
+            -- priming failed or the frame is gone (destroyed while shut):
+            -- one open attempt, then work if it revealed anything.
+            -- a merely shut bag is left alone (no forced reopen spam).
+            invFrameCache = nil
+            setBagOpen(true)
+            if Flags.Drop and not cancelledDrop(myToken) and dropHasWork() then
+              dropSpamRandom(myToken)
+            else
+              setStatus("Status: drop idle - nothing to drop")
+            end
           else
             setStatus("Status: drop idle - nothing to drop")
           end
